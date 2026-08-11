@@ -1,11 +1,10 @@
 import os
 from utils import *
-
 from settings import *
 from gpt import *
 from search import *
 from termcolor import colored
-from flask import jsonify,json
+from flask import jsonify, json
 from video import *
 from tiktokvoice import *
 from uuid import uuid4
@@ -45,9 +44,7 @@ class Shorts:
         global GENERATING
         GENERATING = True
 
-
         change_settings({"IMAGEMAGICK_BINARY": os.getenv("IMAGEMAGICK_BINARY")})
-
 
         self.video_subject = video_subject
         self.paragraph_number = paragraph_number
@@ -56,7 +53,6 @@ class Shorts:
         self.extra_prompt = extra_prompt
         self.script_template = script_template
         self.globalSettings = get_settings()
-
 
         # Generate a script
         self.final_script = ""
@@ -195,13 +191,7 @@ class Shorts:
             for search_term in self.search_terms:
                 global GENERATING
                 if not GENERATING:
-                    return jsonify(
-                        {
-                            "status": "error",
-                            "message": "Video generation was cancelled.",
-                            "data": [],
-                        }
-                    )
+                    raise RuntimeError("Video generation was cancelled.")
                 found_urls = search_for_stock_videos(
                     search_term, os.getenv("PEXELS_API_KEY"), self.videos_quantity_search, self.min_duration_search
                 )
@@ -215,14 +205,9 @@ class Shorts:
         # Check if video_urls is empty
         if not self.video_urls:
             print(colored("[-] No videos found to download.", "red"))
-            return jsonify(
-                {
-                    "status": "error",
-                    "message": "No videos found to download.",
-                    "data": [],
-                }
-            )
-        
+            # Instead of returning jsonify, raise an exception that can be caught in CLI/API
+            raise RuntimeError("No videos found to download. Please check your search terms or API keys.")
+
         # Download the videos
         video_paths = []
         # Let user know
@@ -230,28 +215,22 @@ class Shorts:
         # Save the videos
         for video_url in self.video_urls:
             if not GENERATING:
-                return jsonify(
-                    {
-                        "status": "error",
-                        "message": "Video generation was cancelled.",
-                        "data": [],
-                    }
-                )
+                raise RuntimeError("Video generation was cancelled.")
             try:
                 # Construct the absolute path to the static/assets/temp directory
                 temp_dir_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "static", "assets", "temp"))
                 saved_video_path = save_video(video_url, directory=temp_dir_path)
                 print(colored(f"[+] Saved video: {saved_video_path}", "green"))
                 video_paths.append(saved_video_path)
-            except Exception:
+            except Exception as e:
                 print(colored(f"[-] Could not download video: {video_url}", "red"))
+                # Continue with next video
 
         # Let user know
         print(colored("[+] Videos downloaded!", "green"))
         self.video_paths = video_paths
         # print the video_paths
         print(colored(f"Video paths: {self.video_paths}", "green"))
-
 
     def GenerateMetadata(self):
         self.video_title, self.video_description, self.video_tags, self.video_post_content = generate_metadata(self.video_subject, self.final_script, self.ai_model)
@@ -268,7 +247,7 @@ class Shorts:
 
         # Write the metadata in a json file with the video title as the filename
         self.WriteMetadataToFile(self.video_title, self.video_description, self.video_tags, self.video_post_content, self.suggested_schedule)
-        
+
     def GenerateVoice(self, voice, custom_audio_path="", audio_start_time=0, audio_end_time=0, quality=None, speed=None):
         print(colored(f"[X] Generating voice: {voice} ", "green"))
         global GENERATING
@@ -318,8 +297,7 @@ class Shorts:
 
             if engine == "supertonic":
                 if not GENERATING:
-                    return jsonify({"status": "error", "message": "Video generation was cancelled.", "data": []})
-
+                    raise RuntimeError("Video generation was cancelled.")
                 tts_settings = get_tts_settings()
                 fileId = uuid4()
                 supertonic_path = os.path.join(temp_dir_path, f"{fileId}.wav")
@@ -348,7 +326,7 @@ class Shorts:
                 print(colored(f"[*] Using TikTok TTS sentence-by-sentence (voice: {tiktok_voice})", "yellow"))
                 for sentence in sentences:
                     if not GENERATING:
-                        return jsonify({"status": "error", "message": "Video generation was cancelled.", "data": []})
+                        raise RuntimeError("Video generation was cancelled.")
                     fileId = uuid4()
                     current_tts_path = os.path.join(temp_dir_path, f"{fileId}.mp3")
                     tts_with_fallback(sentence, tiktok_voice, filename=current_tts_path)
