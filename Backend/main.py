@@ -1,1573 +1,633 @@
-import json
 import os
 import sys
+import json
+import argparse
+import time
+import uuid
+import threading
+import shutil
 import subprocess
 import requests
 from datetime import datetime
-from utils import *
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+from termcolor import colored
 from dotenv import load_dotenv
 
 # Load environment variables
-if os.path.exists(".env"):
-    load_dotenv(".env")
-else:
-    load_dotenv("../.env")
+load_dotenv()
 
-# Safe check for environment variables (Prevents NoneType crash in CLI)
-try:
-    check_env_vars()
-except Exception as env_err:
-    print(colored(f"[!] Warning checking env vars: {env_err}. Continuing safely...", "yellow"))
-
-from gpt import *
-from video import *
-from search import *
-from classes.Shorts import *
-from uuid import uuid4
-from tiktokvoice import *
+# Import Backend modules
 from settings import *
-from flask_cors import CORS
-from termcolor import colored
-from youtube import upload_video
-from apiclient.errors import HttpError
-from flask import Flask, request, jsonify, send_from_directory
-from werkzeug.utils import secure_filename
-from moviepy.config import change_settings
-try:
-    from classes.instagram_downloader import InstagramDownloader
-    _HAS_INSTAGRAM = True
-except Exception as _e:
-    print(colored(f"[!] Instagram downloader unavailable: {_e}", "yellow"))
-    _HAS_INSTAGRAM = False
-    InstagramDownloader = None
+from gpt import *
+from search import *
+from video import *
+from utils import *
+from classes.Shorts import Shorts
+from classes.instagram_downloader import InstagramDownloader
+from leadgen.campaign_store import *
+from leadgen.scrape import scrape_url
+from leadgen.enrichment import *
+from leadgen.adapters.devtools_adapter import DevToolsAdapter
 
-try:
-    from leadgen.adapters.devtools_adapter import DevToolsAdapter
-    from leadgen.enrichment import (
-        enrich_campaign_description, enrich_campaign_with_website,
-        enhance_profile_analysis, find_related_niche_queries,
-        suggest_engagement, analyze_competitor, analyze_viral_post,
-        generate_lead_keywords, generate_engagement_keywords,
-        generate_synthetic_leads, qualify_search_results
-    )
-    from leadgen.campaign_store import (
-        create_campaign, get_campaigns, get_campaign, delete_campaign,
-        add_lead, get_leads, add_competitor, remove_competitor, add_viral_post
-    )
-    _HAS_LEADGEN = True
-except Exception as _e:
-    print(colored(f"[!] Leadgen module unavailable: {_e}", "yellow"))
-    _HAS_LEADGEN = False
+# ============================================================
+# Flask App Initialization
+# ============================================================
+app = Flask(__name__)
+CORS(app)
 
-# Set environment variables
-SESSION_ID = os.getenv("TIKTOK_SESSION_ID")
-openai_api_key = os.getenv('OPENAI_API_KEY')
-change_settings({"IMAGEMAGICK_BINARY": os.getenv("IMAGEMAGICK_BINARY")})
+# ============================================================
+# Configuration
+# ============================================================
+UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "static", "assets", "temp")
+ALLOWED_EXTENSIONS = {'mp4', 'mov', 'avi', 'mkv', 'webm', 'flv', 'wmv'}
 
-# Initialize Flask
-app = Flask(__name__, static_folder="static", static_url_path="/static")
-CORS(app, origins="*", supports_credentials=True, expose_headers=[
-    "Content-Range", "Accept-Ranges", "Content-Length",
-    "Cache-Control", "Content-Type", "Content-Disposition"
-])
+# ============================================================
+# Helper Functions
+# ============================================================
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# Constants
-HOST = "0.0.0.0"
-PORT = 8080
-AMOUNT_OF_STOCK_VIDEOS = 5
-GENERATING = False
-
-# Create required folders
-def create_folders():
-    """Create all required folders for the application"""
-    folders = [
-        "static",
-        "static/assets",
+def ensure_dirs():
+    dirs = [
+        "static/generated_videos",
+        "static/generated_videos/instagram",
         "static/assets/temp",
         "static/assets/subtitles",
         "static/assets/custom_audio",
-        "static/generated_videos",
-        "static/generated_videos/instagram",
+        "static/assets/music",
+        "data"
     ]
-    
-    for folder in folders:
-        folder_path = os.path.join(os.path.dirname(__file__), folder)
-        os.makedirs(folder_path, exist_ok=True)
-        print(f"Created/verified folder: {folder_path}")
+    for d in dirs:
+        os.makedirs(os.path.join(os.path.dirname(__file__), d), exist_ok=True)
 
-create_folders()
+# ============================================================
+# API Routes
+# ============================================================
 
+@app.route('/api/script', methods=['POST'])
+def generate_script():
+    """Generate script and search terms using AI"""
+    data = request.json
+    video_subject = data.get('videoSubject')
+    ai_model = data.get('aiModel', 'g4f')
+    extra_prompt = data.get('extraPrompt', '')
+    script_template = data.get('scriptTemplate', 'viral_shorts')
 
-@app.before_request
-def _guard_optional_modules():
-    """Return 503 for routes that depend on optional modules when those modules failed to load."""
-    if request.path.startswith("/api/leadgen") and not _HAS_LEADGEN:
-        return jsonify({"status": "error", "message": "Leadgen module is not available in this environment."}), 503
+    if not video_subject:
+        return jsonify({"status": "error", "message": "videoSubject is required"}), 400
 
-
-# Instagram video download endpoint
-@app.route("/api/instagram/download", methods=["POST"])
-def download_instagram_video():
     try:
-        data = request.get_json()
-        video_url = data.get('url')
-        
-        if not video_url:
-            return jsonify({
-                "status": "error",
-                "message": "No Instagram URL provided",
-            }), 400
-
-        if not _HAS_INSTAGRAM or InstagramDownloader is None:
-            return jsonify({
-                "status": "error",
-                "message": "Instagram downloader is not available in this environment.",
-            }), 503
-
-        downloader = InstagramDownloader(
-            output_path=os.path.join(os.path.dirname(__file__), "static/generated_videos/instagram"),
-            cookies_from_browser='chrome',
-        )
-        
-        result = downloader.download_video(video_url)
-        
+        shorts = Shorts(video_subject, 1, ai_model, extra_prompt=extra_prompt, script_template=script_template)
+        script = shorts.GenerateScript()
+        search_terms = shorts.GenerateSearchTerms()
         return jsonify({
             "status": "success",
-            "message": "Video downloaded successfully",
-            "data": result
-        })
-        
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e),
-        }), 500
-
-
-# Generation Endpoint (WITH AUTO AI-MODEL FALLBACK & HIGHLIGHTED SUBTITLES)
-@app.route("/api/generate", methods=["POST"])
-def generate():
-    try:
-        global GENERATING
-        GENERATING = True
-
-        # Clean temp paths
-        clean_dir(os.path.join(os.path.dirname(__file__), "static/assets/temp/"))
-        clean_dir(os.path.join(os.path.dirname(__file__), "static/assets/subtitles/"))
-
-        # Parse JSON safely
-        data = request.get_json() or {}
-        paragraph_number = int(data.get('paragraphNumber', 1))
-        
-        # Smart AI Model Fallback
-        raw_model = data.get('aiModel', '')
-        valid_models = ["gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4o-mini", "g4f"]
-        if raw_model in valid_models:
-            ai_model = raw_model
-        else:
-            print(colored(f"[!] Invalid or empty AI model '{raw_model}'. Auto-fallback to top quality model 'gpt-4o-mini'", "yellow"))
-            ai_model = "gpt-4o-mini"
-
-        n_threads = data.get('threads')
-        
-        # --- SUBTITLES CONFIGURATION (Word-by-Word Highlighting) ---
-        subtitles_position = data.get('subtitlesPosition', 'center,bottom')
-        subtitle_template = data.get('subtitleTemplate', 'highlight') # Defaulting to dynamic highlight
-        custom_subtitle = data.get('customSubtitle', '')
-        # -----------------------------------------------------
-
-        use_music = data.get('useMusic', False)
-        automate_youtube_upload = data.get('automateYoutubeUpload', False)
-
-        video_subject = data.get("videoSubject", "")
-        custom_prompt = data.get("customPrompt", "")
-
-        print(colored("[Video to be generated]", "blue"))
-        print(colored(f"   Subject: {video_subject}", "blue"))
-        print(colored(f"   AI Model: {ai_model}", "blue"))
-        print(colored(f"   Custom Prompt: {custom_prompt}", "blue"))
-
-        if not GENERATING:
-            return jsonify({
-                "status": "error",
-                "message": "Video generation was cancelled.",
-                "data": [],
-            })
-        
-        voice = data.get("voice", "en_us_006")
-        if not voice:
-            print(colored("[!] No voice was selected. Defaulting to \"en_us_006\"", "yellow"))
-            voice = "en_us_006"
-
-        script_template = data.get("scriptTemplate", "")
-        selectedVideoUrls = data.get("selectedVideoUrls", [])
-        directVideoPaths = data.get("directVideoPaths", [])
-        images = data.get("images", [])
-        image_duration = data.get("imageDuration", 5.0)
-        image_durations = data.get("imageDurations", [])
-        clip_duration = int(data.get("clipDuration", 3))
-
-        videoClass = Shorts(video_subject, paragraph_number, ai_model, custom_prompt, script_template=script_template)
-        videoClass.clip_duration = clip_duration
-        
-        # --- PASSING SUBTITLE SETTINGS TO CLASS ---
-        videoClass.subtitles_position = subtitles_position
-        videoClass.subtitle_template = subtitle_template
-        videoClass.custom_subtitle = custom_subtitle
-        # -----------------------------------------
-        
-        # Generate script & search terms
-        videoClass.GenerateScript()
-        videoClass.GenerateSearchTerms()
-
-        if directVideoPaths and len(directVideoPaths) > 0:
-            videoClass.video_paths = directVideoPaths
-            print(colored(f"[+] Using {len(directVideoPaths)} pre-downloaded video(s): {directVideoPaths}", "green"))
-        else:
-            videoClass.DownloadVideos(selectedVideoUrls)
-
-        if images:
-            temp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static", "assets", "temp"))
-            resolved_images = []
-            resolved_durations = []
-            for i, img in enumerate(images):
-                img_path = os.path.join(temp_dir, os.path.basename(img))
-                if os.path.exists(img_path):
-                    resolved_images.append(img_path)
-                elif os.path.exists(img):
-                    resolved_images.append(img)
-                dur = float(image_durations[i]) if i < len(image_durations) and image_durations[i] else float(image_duration)
-                resolved_durations.append(dur)
-            videoClass.image_paths = resolved_images
-            videoClass.image_durations = resolved_durations
-            videoClass.image_duration = float(image_duration) if image_duration else 5.0
-            print(colored(f"[+] Using {len(resolved_images)} image(s) with durations: {resolved_durations}", "green"))
-
-        if not GENERATING:
-            return jsonify({
-                "status": "error",
-                "message": "Video generation was cancelled.",
-                "data": [],
-            })
-
-        videoClass.GenerateVoice(voice)
-        videoClass.CombineVideos()
-        videoClass.GenerateMetadata()
-
-        # YouTube Upload (Safe Execution)
-        if automate_youtube_upload:
-            client_secrets_file = os.path.abspath("./client_secret.json")
-            if not os.path.exists(client_secrets_file):
-                print(colored("[-] Client secrets file missing. YouTube upload will be skipped.", "yellow"))
-            else:
-                try:
-                    title = getattr(videoClass, 'video_title', video_subject or 'Generated Short')
-                    description = getattr(videoClass, 'video_description', '')
-                    keywords = getattr(videoClass, 'video_tags', [])
-                    
-                    video_response = upload_video(
-                        video_path=videoClass.get_final_video_path,
-                        title=title,
-                        description=description,
-                        category="28",
-                        keywords=",".join(keywords) if isinstance(keywords, list) else str(keywords),
-                        privacy_status="private"
-                    )
-                    print(f"Uploaded video ID: {video_response.get('id')}")
-                except HttpError as e:
-                    print(f"An HTTP error {e.resp.status} occurred:\n{e.content}")
-                except Exception as e:
-                    print(colored(f"[-] YouTube upload error: {str(e)}", "red"))
-
-        # Add background music safely
-        try:
-            videoClass.AddMusic(use_music)
-        except Exception as music_err:
-            print(colored(f"[-] Warning adding music: {music_err}", "yellow"))
-
-        print(colored(f"[+] Video generated: {videoClass.get_final_video_path}!", "green"))
-        videoClass.Stop()
-
-        final_path_raw = videoClass.get_final_video_path
-        if final_path_raw and "/static" in final_path_raw:
-            final_video_path = "/static" + final_path_raw.split("/static")[1]
-        else:
-            final_video_path = final_path_raw or ""
-
-        return jsonify({
-            "status": "success",
-            "message": "Video generated successfully!",
-            "data": final_video_path,
-        })
-
-    except Exception as err:
-        print(colored(f"[-] Error: {str(err)}", "red"))
-        return jsonify({
-            "status": "error",
-            "message": f"Generation failed: {str(err)}",
-            "data": [],
-        })
-
-
-@app.route("/api/cancel", methods=["POST"])
-def cancel():
-    print(colored("[!] Received cancellation request...", "yellow"))
-    global GENERATING
-    GENERATING = False
-    return jsonify({"status": "success", "message": "Cancelled video generation."})
-
-
-@app.route("/api/script", methods=["POST"])
-def generate_script_only():
-    global GENERATING
-    GENERATING = True
-
-    clean_dir(os.path.join(os.path.dirname(__file__), "static/assets/subtitles/"))
-    print(colored("[+] Received script request...", "green"))
-
-    data = request.get_json() or {}
-    video_subject = data.get("videoSubject", "")
-    extra_prompt = data.get("extraPrompt", "")
-    
-    raw_model = data.get("aiModel", "")
-    valid_models = ["gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4o-mini", "g4f"]
-    ai_model = raw_model if raw_model in valid_models else "gpt-4o-mini"
-    
-    script_template = data.get("scriptTemplate", "")
-
-    videoClass = Shorts(video_subject, 1, ai_model, "", extra_prompt=extra_prompt, script_template=script_template)
-    script = videoClass.GenerateScript()
-    search_terms = videoClass.GenerateSearchTerms()
-    
-    print(colored(f"Search terms: {', '.join(search_terms)}", "cyan"))
-
-    return jsonify({
-        "status": "success",
-        "message": "Script generated!",
-        "data": {
-            "script": script,
-            "search": search_terms
-        },
-    })
-
-
-@app.route("/api/search-and-download", methods=["POST"])
-def search_and_download():
-    global GENERATING
-    GENERATING = True
-
-    print(colored("[+] Received search and download request...", "green"))
-
-    data = request.get_json() or {}
-    search_terms = data.get("search", [])
-    script = data.get("script", "")
-    
-    raw_model = data.get("aiModel", "")
-    valid_models = ["gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4o-mini", "g4f"]
-    ai_model = raw_model if raw_model in valid_models else "gpt-4o-mini"
-
-    voice = data.get("voice", "en_us_006")
-    selectedVideoUrls = data.get("selectedVideoUrls", [])
-    directVideoPaths = data.get("directVideoPaths", [])
-    use_music = data.get("useMusic", False)
-
-    subtitles_position = data.get("subtitlesPosition", "center,bottom")
-    subtitle_template = data.get("subtitleTemplate", "highlight") # Word-by-word highlight enabled by default
-    aspect_ratio = data.get("aspectRatio", "9:16")
-    custom_subtitle = data.get("customSubtitle", "")
-    custom_audio_path = data.get("customAudioPath", "")
-    audio_start_time = data.get("audioStartTime", 0)
-    audio_end_time = data.get("audioEndTime", 0)
-    images = data.get("images", [])
-    image_duration = data.get("imageDuration", 5.0)
-    image_durations = data.get("imageDurations", [])
-
-    if not voice:
-        print(colored("[!] No voice was selected. Defaulting to \"en_us_006\"", "yellow"))
-        voice = "en_us_006"
-
-    videoClass = Shorts("", 1, ai_model, '', script_template=data.get("scriptTemplate", ""))
-    videoClass.search_terms = search_terms
-    videoClass.final_script = script
-    videoClass.subtitles_position = subtitles_position
-    videoClass.subtitle_template = subtitle_template
-    videoClass.aspect_ratio = aspect_ratio
-    videoClass.custom_subtitle = custom_subtitle
-    videoClass.clip_duration = int(data.get("clipDuration", 3))
-
-    if directVideoPaths and len(directVideoPaths) > 0:
-        videoClass.video_paths = directVideoPaths
-        print(colored(f"[+] Using {len(directVideoPaths)} pre-downloaded video(s): {directVideoPaths}", "green"))
-    else:
-        videoClass.DownloadVideos(selectedVideoUrls)
-
-    if images:
-        temp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static", "assets", "temp"))
-        resolved_images = []
-        resolved_durations = []
-        for i, img in enumerate(images):
-            img_path = os.path.join(temp_dir, os.path.basename(img))
-            if os.path.exists(img_path):
-                resolved_images.append(img_path)
-            elif os.path.exists(img):
-                resolved_images.append(img)
-            dur = float(image_durations[i]) if i < len(image_durations) and image_durations[i] else float(image_duration)
-            resolved_durations.append(dur)
-        videoClass.image_paths = resolved_images
-        videoClass.image_durations = resolved_durations
-        videoClass.image_duration = float(image_duration) if image_duration else 5.0
-
-    tts_quality = data.get("quality", 8)
-    tts_speed = data.get("speed", 1.05)
-    tts_lang = data.get("tts_lang", None)
-    if tts_lang:
-        from settings import update_tts_settings
-        update_tts_settings({"tts_lang": tts_lang})
-
-    videoClass.GenerateVoice(voice, custom_audio_path=custom_audio_path, audio_start_time=audio_start_time, audio_end_time=audio_end_time, quality=tts_quality, speed=tts_speed)
-    videoClass.CombineVideos()
-    videoClass.GenerateMetadata()
-    
-    if use_music:
-        try:
-            videoClass.AddMusic(True)
-        except Exception as music_err:
-            print(colored(f"[-] Warning adding music: {music_err}", "yellow"))
-
-    videoClass.Stop()
-
-    if videoClass.get_final_video_path is None:
-        return jsonify({
-            "status": "error",
-            "message": "Video generation was cancelled.",
-            "data": [],
-        }), 500
-    
-    if use_music and videoClass.get_final_music_video_path:
-        final_video_raw = os.path.abspath(os.path.join(os.path.dirname(__file__), "static", "generated_videos", videoClass.get_final_music_video_path))
-    else:
-        final_video_raw = videoClass.get_final_video_path
-
-    def _to_static_url(path: str) -> str:
-        if not path:
-            return None
-        if "/static" in path:
-            return "/static" + path.split("/static", 1)[1]
-        return "/" + path.lstrip("/")
-
-    final_video_path = _to_static_url(final_video_raw)
-    final_audio_path = _to_static_url(videoClass.get_tts_path)
-    final_subtitles_path = _to_static_url(videoClass.get_subtitles_path)
-
-    return jsonify({
-        "status": "success",
-        "message": "Search and download complete!",
-        "data": {
-            "finalAudio": final_audio_path,
-            "subtitles": final_subtitles_path,
-            "finalVideo": final_video_path,
-            "metadata": {
-                "title": getattr(videoClass, 'video_title', ''),
-                "description": getattr(videoClass, 'video_description', ''),
-                "tags": getattr(videoClass, 'video_tags', []),
-                "post_content": getattr(videoClass, 'video_post_content', ''),
-                "suggested_schedule": getattr(videoClass, 'suggested_schedule', '')
+            "data": {
+                "script": script,
+                "search": search_terms
             }
-        }
-    })
-
-
-@app.route("/api/addAudio", methods=["POST"])
-def addAudio():
-    global GENERATING
-    GENERATING = True
-    data = request.get_json() or {}
-    final_video_path = data.get("finalVideo", "")
-    song_path = data.get("songPath", "")
-    
-    raw_model = data.get("aiModel", "")
-    valid_models = ["gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4o-mini", "g4f"]
-    ai_model = raw_model if raw_model in valid_models else "gpt-4o-mini"
-
-    music_source = data.get("musicSource", "library")
-    background_music_from_video = data.get("backgroundMusicFromVideo", "")
-    aspect_ratio = data.get("aspectRatio", "9:16")
-
-    backend_dir = os.path.dirname(os.path.abspath(__file__))
-    videoClass = Shorts("", 1, ai_model, '')
-    videoClass.aspect_ratio = aspect_ratio
-    videoClass.final_video_path = os.path.join(backend_dir, final_video_path.lstrip("/"))
-
-    actual_song_path = song_path
-    if music_source == "video":
-        if background_music_from_video:
-            if background_music_from_video.startswith("http://") or background_music_from_video.startswith("https://"):
-                try:
-                    temp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static", "assets", "temp"))
-                    os.makedirs(temp_dir, exist_ok=True)
-                    local_video = save_video(background_music_from_video, directory=temp_dir)
-                    if local_video and os.path.exists(local_video):
-                        actual_song_path = local_video
-                    else:
-                        return jsonify({
-                            "status": "error",
-                            "message": "Could not download the source video to extract audio.",
-                            "data": [],
-                        }), 400
-                except Exception as e:
-                    return jsonify({
-                        "status": "error",
-                        "message": f"Error downloading source video: {str(e)}",
-                        "data": [],
-                    }), 500
-            else:
-                actual_song_path = background_music_from_video
-        else:
-            return jsonify({
-                "status": "error",
-                "message": "No source video selected for music extraction.",
-                "data": [],
-            }), 400
-
-    videoClass.AddMusic(True, actual_song_path, music_source=music_source if music_source == "video" else "library")
-
-    videoClass.Stop()
-    final_music_path = videoClass.get_final_music_video_path
-    if not final_music_path:
-        return jsonify({
-            "status": "error",
-            "message": "Could not add music to the video.",
-            "data": [],
-        }), 500
-
-    return jsonify({
-        "status": "success",
-        "message": "Music added to the video successfully.",
-        "data": {
-            "finalVideo": "static/generated_videos/" + final_music_path
-        }
-    })
-
-
-@app.route("/api/upload-custom-audio", methods=["POST"])
-def upload_custom_audio():
-    audio_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static", "assets", "custom_audio"))
-    os.makedirs(audio_dir, exist_ok=True)
-
-    if "file" not in request.files:
-        return jsonify({"status": "error", "message": "No file provided"}), 400
-
-    file = request.files["file"]
-    if file.filename == "":
-        return jsonify({"status": "error", "message": "No file selected"}), 400
-
-    allowed_ext = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".wma", ".mp4", ".mov", ".webm"}
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in allowed_ext:
-        return jsonify({"status": "error", "message": f"Unsupported format: {ext}"}), 400
-
-    file_id = f"{uuid4()}{ext}"
-    save_path = os.path.join(audio_dir, file_id)
-    file.save(save_path)
-
-    print(colored(f"[+] Uploaded custom audio: {file_id}", "green"))
-    return jsonify({
-        "status": "success",
-        "message": "Audio uploaded",
-        "data": {"filename": file_id, "path": os.path.join("static", "assets", "custom_audio", file_id)}
-    })
-
-
-@app.route("/api/upload-music", methods=["POST"])
-def upload_music():
-    music_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static", "assets", "music"))
-    os.makedirs(music_dir, exist_ok=True)
-
-    if "file" not in request.files:
-        return jsonify({"status": "error", "message": "No file provided"}), 400
-
-    file = request.files["file"]
-    if file.filename == "":
-        return jsonify({"status": "error", "message": "No file selected"}), 400
-
-    allowed_ext = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".wma"}
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in allowed_ext:
-        return jsonify({"status": "error", "message": f"Unsupported audio format: {ext}."}), 400
-
-    filename = secure_filename(file.filename)
-    file.save(os.path.join(music_dir, filename))
-    print(colored(f"[+] Uploaded music: {filename}", "green"))
-    return jsonify({"status": "success", "message": f"Uploaded {filename}", "data": {"filename": filename}})
-
-
-@app.route("/api/download-music-url", methods=["POST"])
-def download_music_url():
-    music_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static", "assets", "music"))
-    temp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static", "assets", "temp"))
-    os.makedirs(music_dir, exist_ok=True)
-    os.makedirs(temp_dir, exist_ok=True)
-
-    data = request.get_json() or {}
-    url = data.get("url", "").strip()
-    if not url:
-        return jsonify({"status": "error", "message": "No URL provided"}), 400
-
-    try:
-        import yt_dlp
-        import subprocess
-        import uuid
-
-        print(colored(f"[X] Downloading video from: {url}", "blue"))
-
-        download_id = str(uuid.uuid4())[:8]
-        ydl_opts = {
-            "format": "bestvideo+bestaudio/best",
-            "outtmpl": os.path.join(temp_dir, f"{download_id}.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": False,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            video_path = ydl.prepare_filename(info)
-            title = info.get("title", "audio")
-
-        if not os.path.exists(video_path):
-            base = os.path.splitext(video_path)[0]
-            for ext in [".mkv", ".webm", ".mp4"]:
-                candidate = base + ext
-                if os.path.exists(candidate):
-                    video_path = candidate
-                    break
-
-        safe_title = "".join(c for c in title if c.isalnum() or c in " _-").strip()[:60]
-        output_mp3 = os.path.join(music_dir, f"{safe_title}.mp3")
-
-        print(colored(f"[X] Extracting audio to: {output_mp3}", "blue"))
-        subprocess.run(
-            ["ffmpeg", "-i", video_path, "-vn", "-acodec", "libmp3lame", "-ab", "192k", output_mp3, "-y"],
-            capture_output=True, check=True
-        )
-
-        os.remove(video_path)
-
-        final_name = os.path.basename(output_mp3)
-        print(colored(f"[+] Downloaded and extracted audio: {final_name}", "green"))
-        return jsonify({
-            "status": "success",
-            "message": f"Downloaded and extracted audio: {final_name}",
-            "data": {"filename": final_name, "title": title}
-        })
-
-    except subprocess.CalledProcessError as e:
-        print(colored(f"[-] FFmpeg error: {e.stderr.decode()[:200]}", "red"))
-        return jsonify({"status": "error", "message": f"Audio extraction failed: {e.stderr.decode()[:200]}"}), 500
-    except Exception as e:
-        print(colored(f"[-] Error downloading audio: {str(e)}", "red"))
-        return jsonify({"status": "error", "message": f"Download failed: {str(e)}"}), 500
-
-
-@app.route("/api/upload-video", methods=["POST"])
-def handle_video_upload():
-    instagram_dir = os.path.join(os.path.dirname(__file__), "static/generated_videos/instagram")
-    os.makedirs(instagram_dir, exist_ok=True)
-
-    if "file" not in request.files:
-        return jsonify({"status": "error", "message": "No file provided"}), 400
-
-    files = request.files.getlist("file")
-    if not files or files[0].filename == "":
-        return jsonify({"status": "error", "message": "No files selected"}), 400
-
-    uploaded = []
-    allowed_ext = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"}
-    for file in files:
-        ext = os.path.splitext(file.filename)[1].lower()
-        if ext not in allowed_ext:
-            continue
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        safe_name = secure_filename(file.filename)
-        final_name = f"{timestamp}_{safe_name}"
-        file.save(os.path.join(instagram_dir, final_name))
-        uploaded.append(final_name)
-
-    if not uploaded:
-        return jsonify({"status": "error", "message": "No valid video files uploaded"}), 400
-
-    print(colored(f"[+] Uploaded {len(uploaded)} video(s): {', '.join(uploaded)}", "green"))
-    return jsonify({
-        "status": "success",
-        "message": f"Uploaded {len(uploaded)} video(s)",
-        "data": {"filenames": uploaded}
-    })
-
-@app.route("/api/upload-image", methods=["POST"])
-def upload_image():
-    temp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static", "assets", "temp"))
-    os.makedirs(temp_dir, exist_ok=True)
-
-    if "file" not in request.files:
-        return jsonify({"status": "error", "message": "No file provided"}), 400
-
-    files = request.files.getlist("file")
-    if not files or files[0].filename == "":
-        return jsonify({"status": "error", "message": "No files selected"}), 400
-
-    uploaded = []
-    allowed_ext = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
-    for file in files:
-        ext = os.path.splitext(file.filename)[1].lower()
-        if ext not in allowed_ext:
-            continue
-        safe_name = secure_filename(file.filename)
-        final_name = f"{uuid4()}_{safe_name}"
-        file.save(os.path.join(temp_dir, final_name))
-        uploaded.append(f"static/assets/temp/{final_name}")
-
-    if not uploaded:
-        return jsonify({"status": "error", "message": "No valid image files uploaded"}), 400
-
-    print(colored(f"[+] Uploaded {len(uploaded)} image(s): {', '.join(uploaded)}", "green"))
-    return jsonify({
-        "status": "success",
-        "message": f"Uploaded {len(uploaded)} image(s)",
-        "data": {"paths": uploaded}
-    })
-
-
-@app.route("/api/extract-frame", methods=["POST"])
-def extract_frame():
-    data = request.get_json() or {}
-    video_filename = data.get("videoFilename", "")
-    video_url = data.get("videoUrl", "")
-    timestamp = float(data.get("timestamp", 0.0))
-
-    temp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static", "assets", "temp"))
-    os.makedirs(temp_dir, exist_ok=True)
-
-    video_path = None
-    source_label = ""
-
-    if video_url:
-        source_label = "URL"
-        import uuid as uuid_mod
-        local_path = os.path.join(temp_dir, f"{uuid_mod.uuid4()}_source.mp4")
-        try:
-            r = requests.get(video_url, stream=True, timeout=30)
-            r.raise_for_status()
-            with open(local_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            video_path = local_path
-            print(colored(f"[+] Downloaded video from URL for frame extraction", "green"))
-        except Exception as e:
-            print(colored(f"[-] Failed to download video URL: {e}", "red"))
-            return jsonify({"status": "error", "message": f"Failed to download video: {e}"}), 400
-    elif video_filename:
-        source_label = video_filename
-        video_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static", "generated_videos"))
-        video_path = os.path.join(video_dir, video_filename)
-        if not os.path.exists(video_path):
-            return jsonify({"status": "error", "message": "Video not found"}), 404
-    else:
-        return jsonify({"status": "error", "message": "videoFilename or videoUrl is required"}), 400
-
-    output_path = os.path.join(temp_dir, f"thumb_{uuid4()}.jpg")
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(timestamp),
-        "-i", video_path,
-        "-vframes", "1",
-        "-q:v", "2",
-        output_path,
-    ]
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0 or not os.path.exists(output_path):
-            print(colored(f"[-] Frame extraction failed: {result.stderr[-200:]}", "red"))
-            return jsonify({"status": "error", "message": "Frame extraction failed"}), 500
-        print(colored(f"[+] Extracted frame at {timestamp}s from {source_label}", "green"))
-        return jsonify({
-            "status": "success",
-            "data": {"path": f"static/assets/temp/{os.path.basename(output_path)}"}
         })
     except Exception as e:
-        print(colored(f"[-] Frame extraction error: {e}", "red"))
         return jsonify({"status": "error", "message": str(e)}), 500
-    finally:
-        if video_url and video_path and os.path.exists(video_path):
-            try:
-                os.remove(video_path)
-            except Exception:
-                pass
 
 
-@app.route("/api/getSongs", methods=["GET"])
-def get_songs():
-    songs = os.listdir(os.path.join(os.path.dirname(__file__), "static/assets/music"))
-    return jsonify({
-        "status": "success",
-        "message": "Songs retrieved successfully!",
-        "data": {"songs": songs}
-    })
+@app.route('/api/search-and-download', methods=['POST'])
+def search_and_download():
+    """Full video generation pipeline"""
+    data = request.json
+    script = data.get('script')
+    voice = data.get('voice', 'M3')
+    search_terms = data.get('search', [])
+    ai_model = data.get('aiModel', 'g4f')
+    selected_video_urls = data.get('selectedVideoUrls', [])
+    subtitles_position = data.get('subtitlesPosition', 'center,bottom')
+    subtitle_template = data.get('subtitleTemplate', 'classic')
+    aspect_ratio = data.get('aspectRatio', '9:16')
+    custom_subtitle = data.get('customSubtitle', '')
+    script_template = data.get('scriptTemplate', 'viral_shorts')
+    custom_audio_path = data.get('customAudioPath', '')
+    audio_start_time = data.get('audioStartTime', 0)
+    audio_end_time = data.get('audioEndTime', 0)
+    images = data.get('images', [])
+    image_durations = data.get('imageDurations', [])
+    image_duration = data.get('imageDuration', 5)
+    clip_duration = data.get('clipDuration', 10)
 
+    if not script:
+        return jsonify({"status": "error", "message": "Script is required"}), 400
 
-@app.route("/api/getVideos", methods=["GET"])
-def get_videos():
-    generated_dir = os.path.join(os.path.dirname(__file__), "static/generated_videos")
-    videos = [f for f in os.listdir(generated_dir) if f.endswith(".mp4")]
+    try:
+        # Use a dummy subject for metadata generation
+        video_subject = "Generated Video"
+        shorts = Shorts(video_subject, 1, ai_model, extra_prompt="", script_template=script_template)
+        shorts.final_script = script
+        shorts.custom_subtitle = custom_subtitle
+        shorts.aspect_ratio = aspect_ratio
+        shorts.subtitle_template = subtitle_template
+        shorts.subtitles_position = subtitles_position
+        shorts.clip_duration = clip_duration
+        shorts.image_paths = images
+        shorts.image_durations = image_durations
+        shorts.image_duration = image_duration
 
-    video_list = []
-    for video in videos:
-        metadata = None
-        meta_path = os.path.join(generated_dir, video.replace(".mp4", ".json"))
-        if os.path.exists(meta_path):
-            try:
-                with open(meta_path) as f:
-                    metadata = json.load(f)
-            except Exception:
-                pass
-        video_list.append({
-            "filename": video,
-            "url": f"/api/video/{video}",
-            "metadata": metadata
+        # Handle search terms
+        if isinstance(search_terms, str):
+            search_terms = [s.strip() for s in search_terms.split(',') if s.strip()]
+        shorts.search_terms = search_terms
+
+        # Download videos
+        shorts.DownloadVideos(selected_video_urls)
+
+        # Generate voice
+        shorts.GenerateVoice(voice, custom_audio_path, audio_start_time, audio_end_time)
+
+        # Combine videos
+        shorts.CombineVideos()
+
+        # Generate metadata
+        shorts.GenerateMetadata()
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "finalVideo": shorts.get_final_video_path,
+                "finalAudio": shorts.get_tts_path,
+                "subtitles": shorts.get_subtitles_path,
+                "metadata": {
+                    "title": shorts.video_title,
+                    "description": shorts.video_description,
+                    "tags": shorts.video_tags,
+                    "post_content": shorts.video_post_content,
+                    "suggested_schedule": shorts.suggested_schedule
+                }
+            }
         })
+    except RuntimeError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-    instagram_dir = os.path.join(generated_dir, "instagram")
-    instagram_videos = []
-    if os.path.exists(instagram_dir):
-        for f in os.listdir(instagram_dir):
-            if f.endswith(".mp4"):
+
+@app.route('/api/addAudio', methods=['POST'])
+def add_audio():
+    """Add background music to video"""
+    data = request.json
+    final_video = data.get('finalVideo')
+    song_path = data.get('songPath')
+    ai_model = data.get('aiModel', 'g4f')
+    music_source = data.get('musicSource', 'library')
+    background_music_from_video = data.get('backgroundMusicFromVideo', '')
+    aspect_ratio = data.get('aspectRatio', '9:16')
+
+    if not final_video:
+        return jsonify({"status": "error", "message": "finalVideo is required"}), 400
+
+    try:
+        video_subject = "Music Video"
+        shorts = Shorts(video_subject, 1, ai_model)
+        shorts.final_video_path = final_video
+        shorts.aspect_ratio = aspect_ratio
+
+        use_music = True
+        if music_source == "video":
+            shorts.AddMusic(use_music, custom_song_path=background_music_from_video, music_source="video")
+        else:
+            shorts.AddMusic(use_music, custom_song_path=song_path, music_source="library")
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "finalVideo": shorts.get_final_music_video_path
+            }
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/getVideos', methods=['GET'])
+def get_videos():
+    """List all generated videos"""
+    try:
+        videos_dir = os.path.join(os.path.dirname(__file__), "static", "generated_videos")
+        videos = []
+        for f in os.listdir(videos_dir):
+            if f.endswith('.mp4'):
+                basename = os.path.splitext(f)[0]
+                meta_path = os.path.join(videos_dir, f"{basename}.json")
                 metadata = None
-                meta_path = os.path.join(instagram_dir, f.replace(".mp4", ".json"))
                 if os.path.exists(meta_path):
-                    try:
-                        with open(meta_path) as mf:
-                            metadata = json.load(mf)
-                    except Exception:
-                        pass
-                instagram_videos.append({
+                    with open(meta_path, 'r') as mf:
+                        metadata = json.load(mf)
+                videos.append({
                     "filename": f,
-                    "url": f"/api/video/instagram/{f}",
+                    "url": f"/api/video/{f}",
                     "metadata": metadata
                 })
-    return jsonify({
-        "status": "success",
-        "message": "Videos retrieved successfully!",
-        "data": {
-            "videos": video_list,
-            "instagram": instagram_videos
-        }
-    })
 
-
-@app.route("/api/getSubtitles", methods=["GET"])
-def get_subtitles():
-    subtitles = os.listdir(os.path.join(os.path.dirname(__file__), "static/assets/subtitles"))
-    return jsonify({
-        "status": "success",
-        "message": "Subtitles retrieved successfully!",
-        "data": {"subtitles": subtitles}
-    })
-
-
-@app.route("/api/models", methods=["GET"])
-def get_models():
-    engine = get_tts_engine()
-    voices = get_all_voices().get(engine, get_tiktok_voices())
-    result = {
-        "voices": voices,
-        "tts_engine": engine,
-    }
-    if engine == "supertonic":
-        result["voiceStyles"] = get_supertonic_voices_detailed()
-        result["languages"] = get_supertonic_languages()
-        result["qualityPresets"] = get_supertonic_quality_presets()
-    return jsonify({
-        "status": "success",
-        "message": "Models retrieved successfully!",
-        "data": result
-    })
-
-
-@app.route("/api/assets", methods=["GET"])
-def get_assets():
-    assets_path = os.path.join(os.path.dirname(__file__), "static/assets/temp")
-    video_assets = os.listdir(assets_path)
-    videos = [video for video in video_assets if video.endswith(".mp4")]
-    return jsonify({
-        "status": "success",
-        "message": "Assets retrieved successfully!",
-        "data": {"videos": videos}
-    })
-
-
-@app.route("/api/settings", methods=["GET"])
-def get_global_settings():
-    global_settings = get_settings()
-    return jsonify({
-        "status": "success",
-        "message": "System settings retrieved successfully!",
-        "data": global_settings
-    })
-
-
-@app.route("/api/settings", methods=["POST"])
-def update_global_settings():
-    data = request.get_json() or {}
-    setting_type = data.get("type", "FONT")
-    settings = data.get("settings", {})
-    update_settings(settings, setting_type)
-    return jsonify({
-        "status": "success",
-        "message": "Settings updated successfully!",
-        "data": get_settings()
-    })
-
-
-@app.route("/api/tts/status", methods=["GET"])
-def get_tts_health():
-    status = get_tts_status()
-    return jsonify({
-        "status": "success",
-        "message": "TTS status retrieved successfully!",
-        "data": status
-    })
-
-
-@app.route("/api/tts/voices", methods=["GET"])
-def get_tts_voices():
-    engine = request.args.get("engine", get_tts_engine())
-    voices = get_all_voices().get(engine, get_tiktok_voices())
-    result = {
-        "voices": voices,
-        "engine": engine,
-    }
-    if engine == "supertonic":
-        result["voiceStyles"] = get_supertonic_voices_detailed()
-        result["languages"] = get_supertonic_languages()
-        result["qualityPresets"] = get_supertonic_quality_presets()
-    return jsonify({
-        "status": "success",
-        "message": "Voices retrieved successfully!",
-        "data": result
-    })
-
-
-@app.route("/api/magicsync/accounts", methods=["POST"])
-def magicsync_accounts():
-    try:
-        data = request.get_json() or {}
-        url = data.get("url", os.getenv("MAGICSYNC_BASE_URL", "http://localhost:3000"))
-        api_token = data.get("apiToken", os.getenv("MAGICSYNC_API_TOKEN", ""))
-
-        if not api_token:
-            return jsonify({"status": "error", "message": "API token is required."}), 400
-
-        target_url = f"{url}/api/v1/cli/info"
-        info_resp = requests.get(target_url, headers={"x-api-key": api_token}, timeout=10)
-
-        if info_resp.status_code != 200:
-            return jsonify({"status": "error", "message": f"Failed to connect: {info_resp.text}"}), 502
-
-        platforms_data = info_resp.json()
-        accounts = [
-            {"platform": platform.get("platform"), "accountName": acc.get("accountName"), "isActive": acc.get("isActive", True)}
-            for platform in platforms_data.get("data", {}).get("platforms", [])
-            for acc in platform.get("accounts", [])
-        ]
-
-        platforms_list = list(dict.fromkeys(a.get("platform") for a in accounts if a.get("isActive")))
+        # Instagram videos
+        instagram_dir = os.path.join(videos_dir, "instagram")
+        instagram_videos = []
+        if os.path.exists(instagram_dir):
+            for f in os.listdir(instagram_dir):
+                if f.endswith('.mp4'):
+                    instagram_videos.append({
+                        "filename": f,
+                        "url": f"/static/generated_videos/instagram/{f}",
+                        "metadata": None
+                    })
 
         return jsonify({
             "status": "success",
-            "message": "Accounts retrieved successfully!",
-            "data": {"accounts": accounts, "platforms": platforms_list}
+            "data": {
+                "videos": videos,
+                "instagram": instagram_videos
+            }
         })
-
-    except requests.exceptions.Timeout:
-        return jsonify({"status": "error", "message": "MagicSync API request timed out"}), 504
-    except requests.exceptions.ConnectionError as e:
-        return jsonify({"status": "error", "message": f"Cannot connect to MagicSync at {url}."}), 502
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@app.route("/api/video/<path:filename>")
+@app.route('/api/video/<filename>', methods=['GET'])
 def serve_video(filename):
-    video_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static", "generated_videos"))
-    return send_from_directory(video_dir, filename)
-
-
-@app.route("/api/schedule-to-magicsync", methods=["POST"])
-def schedule_to_magicsync():
+    """Serve generated video file"""
     try:
-        data = request.get_json() or {}
-        video_filename = data.get("videoFilename")
-        scheduled_at = data.get("scheduledAt")
-        content = data.get("content", "")
-        title = data.get("title", "")
-        description = data.get("description", "")
-        platforms = data.get("platforms", [])
-        video_base_url = data.get("videoBaseUrl", "")
+        videos_dir = os.path.join(os.path.dirname(__file__), "static", "generated_videos")
+        return send_from_directory(videos_dir, filename)
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 404
 
-        if not video_filename:
-            return jsonify({"status": "error", "message": "videoFilename is required"}), 400
-        if not platforms:
-            return jsonify({"status": "error", "message": "At least one platform is required"}), 400
 
-        url = data.get("url", os.getenv("MAGICSYNC_BASE_URL", "http://localhost:3000"))
-        api_token = data.get("apiToken", os.getenv("MAGICSYNC_API_TOKEN", ""))
+@app.route('/api/video/delete', methods=['POST'])
+def delete_video():
+    """Delete a generated video and its metadata"""
+    data = request.json
+    filename = data.get('filename')
+    if not filename:
+        return jsonify({"status": "error", "message": "filename is required"}), 400
 
-        if not api_token:
-            return jsonify({"status": "error", "message": "API token is required."}), 400
+    try:
+        videos_dir = os.path.join(os.path.dirname(__file__), "static", "generated_videos")
+        video_path = os.path.join(videos_dir, filename)
+        if os.path.exists(video_path):
+            os.remove(video_path)
+        basename = os.path.splitext(filename)[0]
+        meta_path = os.path.join(videos_dir, f"{basename}.json")
+        if os.path.exists(meta_path):
+            os.remove(meta_path)
+        return jsonify({"status": "success", "message": "Video deleted"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-        if video_base_url:
-            video_url = f"{video_base_url.rstrip('/')}/api/video/{video_filename}"
-        else:
-            base_url = request.host_url.rstrip("/")
-            video_url = f"{base_url}/api/video/{video_filename}"
-        if not content:
-            content = title or description or f"New video: {video_filename}"
+
+@app.route('/api/getSongs', methods=['GET'])
+def get_songs():
+    """List available music files"""
+    try:
+        music_dir = os.path.join(os.path.dirname(__file__), "static", "assets", "music")
+        songs = []
+        if os.path.exists(music_dir):
+            for f in os.listdir(music_dir):
+                if f.endswith(('.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac')):
+                    songs.append(f)
+        return jsonify({"status": "success", "data": {"songs": songs}})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/upload-music', methods=['POST'])
+def upload_music():
+    """Upload music file to library"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({"status": "error", "message": "No file provided"}), 400
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"status": "error", "message": "No file selected"}), 400
+        filename = secure_filename(file.filename)
+        music_dir = os.path.join(os.path.dirname(__file__), "static", "assets", "music")
+        os.makedirs(music_dir, exist_ok=True)
+        file.save(os.path.join(music_dir, filename))
+        return jsonify({"status": "success", "message": "File uploaded"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/download-music-url', methods=['POST'])
+def download_music_url():
+    """Download music from URL using yt-dlp"""
+    data = request.json
+    url = data.get('url')
+    if not url:
+        return jsonify({"status": "error", "message": "URL is required"}), 400
+
+    try:
+        music_dir = os.path.join(os.path.dirname(__file__), "static", "assets", "music")
+        os.makedirs(music_dir, exist_ok=True)
+        import yt_dlp
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': os.path.join(music_dir, '%(title)s.%(ext)s'),
+            'quiet': True,
+            'no_warnings': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        return jsonify({"status": "success", "message": "Downloaded successfully"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/upload-image', methods=['POST'])
+def upload_image():
+    """Upload image for thumbnail/frame"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({"status": "error", "message": "No file provided"}), 400
+        files = request.files.getlist('file')
+        paths = []
+        for file in files:
+            if file.filename == '':
+                continue
+            filename = f"{uuid.uuid4()}_{secure_filename(file.filename)}"
+            images_dir = os.path.join(os.path.dirname(__file__), "static", "assets", "temp")
+            os.makedirs(images_dir, exist_ok=True)
+            filepath = os.path.join(images_dir, filename)
+            file.save(filepath)
+            paths.append(f"static/assets/temp/{filename}")
+        return jsonify({"status": "success", "data": {"paths": paths}})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/upload-custom-audio', methods=['POST'])
+def upload_custom_audio():
+    """Upload custom audio for TTS replacement"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({"status": "error", "message": "No file provided"}), 400
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"status": "error", "message": "No file selected"}), 400
+        filename = f"{uuid.uuid4()}_{secure_filename(file.filename)}"
+        audio_dir = os.path.join(os.path.dirname(__file__), "static", "assets", "custom_audio")
+        os.makedirs(audio_dir, exist_ok=True)
+        filepath = os.path.join(audio_dir, filename)
+        file.save(filepath)
+        return jsonify({"status": "success", "data": {"path": f"static/assets/custom_audio/{filename}"}})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/instagram/download', methods=['POST'])
+def instagram_download():
+    """Download Instagram video"""
+    data = request.json
+    url = data.get('url')
+    if not url:
+        return jsonify({"status": "error", "message": "URL is required"}), 400
+
+    try:
+        downloader = InstagramDownloader(
+            output_path=os.path.join(os.path.dirname(__file__), "static", "generated_videos", "instagram")
+        )
+        result = downloader.download_video(url)
+        return jsonify({"status": "success", "data": result})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/settings', methods=['GET', 'POST'])
+def handle_settings():
+    """Get or update global settings"""
+    if request.method == 'GET':
+        return jsonify({"status": "success", "data": get_settings()})
+
+    data = request.json
+    setting_type = data.get('type', 'FONT')
+    settings = data.get('settings', {})
+    update_settings(settings, setting_type)
+    return jsonify({"status": "success", "message": "Settings updated"})
+
+
+@app.route('/api/tts/status', methods=['GET'])
+def tts_status():
+    """Get TTS engine health status"""
+    return jsonify({"status": "success", "data": get_tts_status()})
+
+
+@app.route('/api/tts/voices', methods=['GET'])
+def tts_voices():
+    """Get voices for specific TTS engine"""
+    engine = request.args.get('engine', 'supertonic')
+    if engine == 'supertonic':
+        return jsonify({
+            "status": "success",
+            "data": {
+                "voices": get_supertonic_voices(),
+                "voiceStyles": get_supertonic_voices_detailed(),
+                "languages": get_supertonic_languages(),
+                "qualityPresets": get_supertonic_quality_presets()
+            }
+        })
+    else:
+        return jsonify({
+            "status": "success",
+            "data": {
+                "voices": get_tiktok_voices()
+            }
+        })
+
+
+@app.route('/api/models', methods=['GET'])
+def get_models():
+    """Get all available voice models"""
+    return jsonify({
+        "status": "success",
+        "data": {
+            "voices": get_all_voices()['supertonic'],
+            "voiceStyles": get_supertonic_voices_detailed()
+        }
+    })
+
+
+@app.route('/api/magicsync/accounts', methods=['POST'])
+def magicsync_accounts():
+    """Get MagicSync connected accounts"""
+    data = request.json
+    url = data.get('url', os.getenv('MAGICSYNC_BASE_URL', 'http://localhost:3000'))
+    api_token = data.get('apiToken', os.getenv('MAGICSYNC_API_TOKEN', ''))
+
+    if not api_token:
+        return jsonify({"status": "error", "message": "API token is required"}), 400
+
+    try:
+        response = requests.post(
+            f"{url}/api/connected-accounts",
+            headers={"Authorization": f"Bearer {api_token}"},
+            timeout=10
+        )
+        if response.status_code == 200:
+            accounts = response.json().get('data', {}).get('accounts', [])
+            return jsonify({"status": "success", "data": {"accounts": accounts}})
+        return jsonify({"status": "error", "message": response.text}), response.status_code
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/schedule-to-magicsync', methods=['POST'])
+def schedule_to_magicsync():
+    """Schedule a video post via MagicSync"""
+    data = request.json
+    video_filename = data.get('videoFilename')
+    scheduled_at = data.get('scheduledAt')
+    content = data.get('content', '')
+    title = data.get('title', '')
+    description = data.get('description', '')
+    platforms = data.get('platforms', [])
+    url = data.get('url', os.getenv('MAGICSYNC_BASE_URL', 'http://localhost:3000'))
+    api_token = data.get('apiToken', os.getenv('MAGICSYNC_API_TOKEN', ''))
+    video_base_url = data.get('videoBaseUrl', os.getenv('VIDEO_BASE_URL', 'http://localhost:8080'))
+
+    if not video_filename or not api_token or not platforms:
+        return jsonify({"status": "error", "message": "videoFilename, apiToken, and platforms are required"}), 400
+
+    try:
+        video_url = f"{video_base_url}/api/video/{video_filename}"
 
         payload = {
+            "videoUrl": video_url,
+            "scheduledAt": scheduled_at,
             "content": content,
+            "title": title,
+            "description": description,
             "platforms": platforms,
-            "media": {"video": video_url},
         }
 
-        if title:
-            payload["title"] = title
-        if description:
-            payload["description"] = description
-        if scheduled_at:
-            payload["scheduledAt"] = scheduled_at
-
-        target_url = f"{url}/api/v1/cli/post"
-        post_resp = requests.post(
-            target_url,
-            headers={"Content-Type": "application/json", "x-api-key": api_token},
+        response = requests.post(
+            f"{url}/api/schedule-post",
+            headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
             json=payload,
             timeout=30
         )
 
-        if post_resp.status_code == 200:
-            return jsonify({
-                "status": "success",
-                "message": "Video scheduled successfully!",
-                "data": post_resp.json()
-            })
-        else:
-            return jsonify({
-                "status": "error",
-                "message": f"MagicSync API error: {post_resp.text}"
-            }), 502
-
-    except requests.exceptions.Timeout:
-        return jsonify({"status": "error", "message": "MagicSync API request timed out"}), 504
-    except requests.exceptions.ConnectionError as e:
-        return jsonify({"status": "error", "message": f"Cannot connect to MagicSync at {url}."}), 502
+        if response.status_code in [200, 201]:
+            return jsonify({"status": "success", "data": response.json().get('data', {})})
+        return jsonify({"status": "error", "message": response.text}), response.status_code
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@app.route("/api/video/delete", methods=["POST"])
-def delete_video():
-    data = request.get_json() or {}
-    filename = data.get("filename", "")
-    if not filename:
-        return jsonify({"status": "error", "message": "filename is required"}), 400
+# ============================================================
+# Lead Generation Routes (Simplified)
+# ============================================================
 
-    generated_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static", "generated_videos"))
-    video_path = os.path.join(generated_dir, filename)
-    basename = os.path.splitext(filename)[0]
-    json_path = os.path.join(generated_dir, f"{basename}.json")
-
-    deleted = []
-    if os.path.exists(video_path):
-        os.remove(video_path)
-        deleted.append(filename)
-    if os.path.exists(json_path):
-        os.remove(json_path)
-        deleted.append(f"{basename}.json")
-
-    if not deleted:
-        return jsonify({"status": "error", "message": "Video file not found"}), 404
-
-    return jsonify({"status": "success", "message": f"Deleted {', '.join(deleted)}"})
-
-
-@app.route("/api/leadgen/health", methods=["GET"])
-def leadgen_health():
-    port = request.args.get("port", 9222, type=int)
-    import asyncio
-    adapter = DevToolsAdapter(chrome_port=port)
-
-    async def check():
-        return await adapter.health_check()
-
-    try:
-        ok = asyncio.run(check())
-        return jsonify({"status": "ok" if ok else "error", "message": "Connected to Chrome" if ok else f"Cannot connect on port {port}"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route("/api/leadgen/twitter-profile", methods=["GET"])
-def leadgen_twitter_profile():
-    username = request.args.get("username", "")
-    port = request.args.get("port", 9222, type=int)
-    if not username:
-        return jsonify({"status": "error", "message": "username required"}), 400
-    import asyncio
-    adapter = DevToolsAdapter(chrome_port=port)
-
-    async def fetch():
-        return await adapter.get_profile(username, "twitter")
-
-    try:
-        profile = asyncio.run(fetch())
-        if profile:
-            return jsonify({"status": "ok", "data": profile.__dict__})
-        return jsonify({"status": "error", "message": "Profile not found"}), 404
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route("/api/leadgen/scrape-url", methods=["POST"])
-def leadgen_scrape_url():
-    try:
-        data = request.get_json() or {}
-        url = data.get("url", "")
-        if not url:
-            return jsonify({"status": "error", "message": "url is required"}), 400
-        from leadgen.scrape import scrape_url as do_scrape
-        result = do_scrape(url)
-        if "error" in result:
-            return jsonify({"status": "error", "message": result["error"]}), 400
-        return jsonify({"status": "ok", "data": result})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route("/api/leadgen/campaign/enrich", methods=["POST"])
-def leadgen_enrich_campaign():
-    try:
-        data = request.get_json() or {}
-        description = data.get("description", "")
-        website_data = data.get("website_data")
-        if not description:
-            return jsonify({"status": "error", "message": "description is required"}), 400
-        if website_data and website_data.get("summary"):
-            result = enrich_campaign_with_website(description, website_data)
-        else:
-            result = enrich_campaign_description(description)
-        return jsonify({"status": "ok", "data": result})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route("/api/leadgen/campaigns", methods=["GET", "POST"])
+@app.route('/api/leadgen/campaigns', methods=['GET', 'POST'])
 def leadgen_campaigns():
-    if request.method == "GET":
-        return jsonify({"status": "ok", "data": get_campaigns()})
+    if request.method == 'GET':
+        return jsonify({"status": "success", "data": get_campaigns()})
 
-    try:
-        data = request.get_json() or {}
-        name = data.get("name", "")
-        description = data.get("description", "")
-        keywords = data.get("keywords", [])
-        platforms = data.get("platforms", [data.get("platform", "twitter")])
-        if isinstance(platforms, str):
-            platforms = [platforms]
-        enrichment = data.get("enrichment")
-        campaign = create_campaign(name, description, keywords, platforms, enrichment)
-        return jsonify({"status": "ok", "data": campaign})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    data = request.json
+    name = data.get('name')
+    description = data.get('description')
+    keywords = data.get('keywords', [])
+    platforms = data.get('platforms', ['twitter'])
+
+    if not name or not description:
+        return jsonify({"status": "error", "message": "name and description are required"}), 400
+
+    enrichment = enrich_campaign_description(description)
+    campaign = create_campaign(name, description, keywords, platforms, enrichment)
+    return jsonify({"status": "success", "data": campaign})
 
 
-@app.route("/api/leadgen/campaigns/<campaign_id>", methods=["GET", "DELETE"])
+@app.route('/api/leadgen/campaigns/<campaign_id>', methods=['GET', 'PUT', 'DELETE'])
 def leadgen_campaign_detail(campaign_id):
-    if request.method == "GET":
+    if request.method == 'GET':
         campaign = get_campaign(campaign_id)
         if not campaign:
             return jsonify({"status": "error", "message": "Campaign not found"}), 404
+        return jsonify({"status": "success", "data": campaign})
+
+    if request.method == 'DELETE':
+        if delete_campaign(campaign_id):
+            return jsonify({"status": "success", "message": "Campaign deleted"})
+        return jsonify({"status": "error", "message": "Campaign not found"}), 404
+
+    data = request.json
+    campaign = update_campaign(campaign_id, data)
+    if not campaign:
+        return jsonify({"status": "error", "message": "Campaign not found"}), 404
+    return jsonify({"status": "success", "data": campaign})
+
+
+@app.route('/api/leadgen/campaigns/<campaign_id>/leads', methods=['GET', 'POST'])
+def leadgen_leads(campaign_id):
+    if request.method == 'GET':
         leads = get_leads(campaign_id)
-        campaign["leads"] = leads
-        return jsonify({"status": "ok", "data": campaign})
+        return jsonify({"status": "success", "data": leads})
 
-    ok = delete_campaign(campaign_id)
-    if not ok:
-        return jsonify({"status": "error", "message": "Campaign not found"}), 404
-    return jsonify({"status": "ok", "message": "Campaign deleted"})
+    data = request.json
+    lead = add_lead(campaign_id, data)
+    return jsonify({"status": "success", "data": lead})
 
 
-@app.route("/api/leadgen/campaigns/<campaign_id>/leads", methods=["POST"])
-def leadgen_add_lead(campaign_id):
-    try:
-        campaign = get_campaign(campaign_id)
-        if not campaign:
-            return jsonify({"status": "error", "message": "Campaign not found"}), 404
-        data = request.get_json() or {}
-        lead = add_lead(campaign_id, data)
-        return jsonify({"status": "ok", "data": lead})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+# ============================================================
+# Health Check & Static Routes
+# ============================================================
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
 
 
-@app.route("/api/leadgen/campaigns/<campaign_id>/competitors", methods=["GET", "POST"])
-def leadgen_campaign_competitors(campaign_id):
-    campaign = get_campaign(campaign_id)
-    if not campaign:
-        return jsonify({"status": "error", "message": "Campaign not found"}), 404
-
-    if request.method == "GET":
-        return jsonify({"status": "ok", "data": campaign.get("competitors", [])})
-
-    try:
-        data = request.get_json() or {}
-        name = data.get("name", "")
-        url = data.get("url", "")
-        if not name:
-            return jsonify({"status": "error", "message": "Competitor name required"}), 400
-
-        try:
-            analysis = analyze_competitor(name, campaign.get("description", ""))
-            competitor = {
-                "name": name,
-                "url": url,
-                "notes": data.get("notes", ""),
-                "analysis": analysis,
-            }
-        except Exception:
-            competitor = {
-                "name": name,
-                "url": url,
-                "notes": data.get("notes", ""),
-            }
-
-        result = add_competitor(campaign_id, competitor)
-        if result:
-            return jsonify({"status": "ok", "data": result})
-        return jsonify({"status": "error", "message": "Failed to add competitor"}), 500
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+@app.route('/static/<path:path>', methods=['GET'])
+def serve_static(path):
+    return send_from_directory(os.path.join(os.path.dirname(__file__), "static"), path)
 
 
-@app.route("/api/leadgen/campaigns/<campaign_id>/competitors/<competitor_id>", methods=["DELETE"])
-def leadgen_remove_competitor(campaign_id, competitor_id):
-    ok = remove_competitor(campaign_id, competitor_id)
-    if not ok:
-        return jsonify({"status": "error", "message": "Competitor not found"}), 404
-    return jsonify({"status": "ok", "message": "Competitor removed"})
-
-
-@app.route("/api/leadgen/campaigns/<campaign_id>/viral-posts", methods=["GET", "POST"])
-def leadgen_campaign_viral_posts(campaign_id):
-    campaign = get_campaign(campaign_id)
-    if not campaign:
-        return jsonify({"status": "error", "message": "Campaign not found"}), 404
-
-    if request.method == "GET":
-        return jsonify({"status": "ok", "data": campaign.get("viral_posts", [])})
-
-    try:
-        data = request.get_json() or {}
-        post_text = data.get("post_text", "")
-        post_url = data.get("post_url", "")
-        username = data.get("username", "")
-
-        if not post_text:
-            return jsonify({"status": "error", "message": "post_text is required"}), 400
-
-        try:
-            analysis = analyze_viral_post(post_text, campaign.get("description", ""))
-            post = {
-                "post_text": post_text,
-                "post_url": post_url,
-                "username": username,
-                "analysis": analysis,
-            }
-        except Exception:
-            post = {
-                "post_text": post_text,
-                "post_url": post_url,
-                "username": username,
-            }
-
-        result = add_viral_post(campaign_id, post)
-        if result:
-            return jsonify({"status": "ok", "data": result})
-        return jsonify({"status": "error", "message": "Failed to save viral post"}), 500
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route("/api/leadgen/twitter-audit", methods=["GET"])
-def leadgen_twitter_audit():
-    username = request.args.get("username", "")
-    port = request.args.get("port", 9222, type=int)
-    if not username:
-        return jsonify({"status": "error", "message": "username required"}), 400
-    import asyncio
-    adapter = DevToolsAdapter(chrome_port=port)
-
-    async def fetch():
-        profile = await adapter.get_profile(username, "twitter")
-        if not profile:
-            return None, []
-        profile_dict = profile.__dict__
-        queries = find_related_niche_queries(profile_dict)
-        all_related = []
-        seen = set()
-        for q in queries:
-            try:
-                results = await adapter.search_keyword(q, "twitter", max_results=5)
-                for r in results:
-                    if r.username and r.username.lower() != username.lower() and r.username not in seen:
-                        seen.add(r.username)
-                        all_related.append(r.__dict__)
-            except Exception:
-                continue
-        return profile_dict, all_related[:10]
-
-    try:
-        profile, related = asyncio.run(fetch())
-        if not profile:
-            return jsonify({"status": "error", "message": "Profile not found"}), 404
-        return jsonify({"status": "ok", "data": {"profile": profile, "related_users": related}})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route("/api/leadgen/campaigns/<campaign_id>/search-leads", methods=["POST"])
-def leadgen_campaign_search_leads(campaign_id):
-    campaign = get_campaign(campaign_id)
-    if not campaign:
-        return jsonify({"status": "error", "message": "Campaign not found"}), 404
-
-    data = request.get_json() or {}
-    port = int(data.get("port", 9222))
-    max_results = int(data.get("max_results", 10))
-    mode = data.get("mode", "leads")
-    custom_keywords = data.get("custom_keywords", [])
-
-    try:
-        if mode == "engagement":
-            search_queries = generate_engagement_keywords(campaign)
-        else:
-            search_queries = generate_lead_keywords(campaign)
-    except Exception:
-        search_queries = campaign.get("keywords", []) + campaign.get("intent_queries", [])
-        search_queries = [q for q in set(search_queries) if q.strip()]
-
-    if custom_keywords:
-        search_queries = list(custom_keywords) + [q for q in search_queries if q not in custom_keywords]
-
-    if not search_queries:
-        return jsonify({"status": "error", "message": "Campaign has no keywords or queries to search for"}), 400
-
-    import asyncio
-    adapter = DevToolsAdapter(chrome_port=port)
-
-    async def fetch():
-        posts = []
-        profiles = {}
-        seen_posts = set()
-        seen_profiles = set()
-
-        for q in search_queries[:6]:
-            try:
-                results = await adapter.search_keyword(q, "twitter", max_results=max_results)
-                for r in results:
-                    if hasattr(r, 'post_url') and r.post_url and r.post_url not in seen_posts:
-                        seen_posts.add(r.post_url)
-                        posts.append(r.__dict__)
-                    if r.username and r.username not in seen_profiles:
-                        seen_profiles.add(r.username)
-                        if r.username not in profiles:
-                            profiles[r.username] = {
-                                "username": r.username,
-                                "display_name": r.display_name,
-                                "avatar_url": r.avatar_url,
-                                "bio": r.bio,
-                                "follower_count": r.follower_count,
-                                "profile_url": r.profile_url,
-                                "matched_keyword": q,
-                            }
-            except Exception:
-                continue
-
-        return posts[:30], list(profiles.values())[:15]
-
-    try:
-        real_posts, real_profiles = asyncio.run(fetch())
-
-        gpt_fallback_used = False
-        if not real_posts and not real_profiles:
-            gpt_fallback_used = True
-            synthetic = generate_synthetic_leads(campaign, mode=mode, count=12)
-            posts = []
-            profiles_list = []
-            for s in synthetic:
-                posts.append(s)
-                if s.get("lead_type") == "lead" and s.get("username"):
-                    profiles_list.append({
-                        "username": s["username"],
-                        "display_name": s.get("display_name", ""),
-                        "avatar_url": "",
-                        "bio": s.get("bio", ""),
-                        "follower_count": s.get("follower_count", 0),
-                        "profile_url": f"https://twitter.com/{s['username']}",
-                        "matched_keyword": "gpt-generated",
-                    })
-            for p in posts:
-                p["_gpt_generated"] = True
-        else:
-            posts = real_posts
-            profiles_list = real_profiles
-
-        qualifications = []
-        if posts:
-            try:
-                qualifications = qualify_search_results(posts, campaign)
-            except Exception as e:
-                print(colored(f"[-] Qualification failed: {e}", "red"))
-
-        for q in qualifications:
-            idx = q.get("index")
-            if idx is not None and idx < len(posts):
-                posts[idx]["qualification"] = {
-                    "score": q.get("score", 5),
-                    "classification": q.get("classification", "warm_lead"),
-                    "reason": q.get("reason", ""),
-                }
-
-        if mode == "engagement":
-            engagement_suggestions = []
-            if posts:
-                try:
-                    post_texts = [p.get("post_text", "")[:200] for p in posts if p.get("post_text")]
-                    if post_texts:
-                        engagement_suggestions = suggest_engagement(post_texts, campaign.get("description", ""))
-                except Exception:
-                    pass
-
-            return jsonify({
-                "status": "ok",
-                "data": {
-                    "posts": posts,
-                    "profiles": profiles_list,
-                    "engagement_suggestions": engagement_suggestions,
-                    "queries_used": search_queries[:6],
-                    "mode": "engagement",
-                    "gpt_fallback_used": gpt_fallback_used,
-                    "qualifications": qualifications,
-                }
-            })
-        else:
-            for p in profiles_list:
-                add_lead(campaign_id, {
-                    "platform": "twitter",
-                    "username": p["username"],
-                    "display_name": p.get("display_name"),
-                    "avatar_url": p.get("avatar_url"),
-                    "bio": p.get("bio"),
-                    "follower_count": p.get("follower_count"),
-                    "profile_url": p.get("profile_url"),
-                    "matched_keyword": p.get("matched_keyword", "gpt-generated"),
-                    "source": "gpt_synthetic" if gpt_fallback_used else "campaign_search",
-                    "intent_score": p.get("intent_score", 0.7),
-                })
-
-            engagement_suggestions = []
-            if posts:
-                try:
-                    post_texts = [p.get("post_text", "")[:200] for p in posts if p.get("post_text")]
-                    if post_texts:
-                        engagement_suggestions = suggest_engagement(post_texts, campaign.get("description", ""))
-                except Exception:
-                    pass
-
-            return jsonify({
-                "status": "ok",
-                "data": {
-                    "posts": posts,
-                    "profiles": profiles_list,
-                    "engagement_suggestions": engagement_suggestions,
-                    "queries_used": search_queries[:6],
-                    "leads_added": len(profiles_list),
-                    "mode": "leads",
-                    "gpt_fallback_used": gpt_fallback_used,
-                    "qualifications": qualifications,
-                }
-            })
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route("/api/leadgen/enhance-profile", methods=["POST"])
-def leadgen_enhance_profile():
-    try:
-        data = request.get_json() or {}
-        profile = data.get("profile", {})
-        if not profile:
-            return jsonify({"status": "error", "message": "profile data is required"}), 400
-        result = enhance_profile_analysis(profile)
-        return jsonify({"status": "ok", "data": result})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-# ==========================================
-# MAIN EXECUTION (WEB SERVER + GITHUB ACTIONS CLI)
-# ==========================================
+# ============================================================
+# Main Entry Point
+# ============================================================
 
 if __name__ == "__main__":
-    import sys
-    import argparse
-    
-    if len(sys.argv) > 1:
-        parser = argparse.ArgumentParser(description="Automated Short Generator")
-        parser.add_argument("--cli", action="store_true", help="Run in CLI mode")
-        parser.add_argument("--prompt", type=str, help="Custom topic for the video", default=None)
-        args, unknown = parser.parse_known_args()
+    # Ensure directories exist
+    ensure_dirs()
 
-        topic_subject = args.prompt if args.prompt else "Interesting Facts"
+    # Check environment variables
+    check_env_vars()
 
-        print(colored(f"[*] Starting Direct HD Video Generation for Topic: '{topic_subject}'...", "green"))
-        
-        create_folders()
-        clean_dir(os.path.join(os.path.dirname(__file__), "static/assets/temp/"))
-        clean_dir(os.path.join(os.path.dirname(__file__), "static/assets/subtitles/"))
+    # Parse command line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cli', action='store_true', help='Run in CLI mode')
+    parser.add_argument('--prompt', type=str, help='Video topic prompt')
+    args = parser.parse_args()
 
-        videoClass = Shorts(topic_subject, 1, "gpt-4o-mini", "")
-        videoClass.clip_duration = 3
-        
-        # --- CLI SUBTITLE & HIGHLIGHT SETTINGS ---
-        videoClass.subtitle_template = "highlight"
-        videoClass.subtitles_position = "center,bottom"
-        
-        videoClass.GenerateScript()
-        videoClass.GenerateSearchTerms()
-        videoClass.DownloadVideos([])
-        videoClass.GenerateVoice("en_us_006")
-        videoClass.CombineVideos()
-        videoClass.GenerateMetadata()
-        
+    if args.cli and args.prompt:
         try:
-            videoClass.AddMusic(True)
-        except Exception as music_err:
-            print(colored(f"[-] Warning adding music in CLI: {music_err}", "yellow"))
-            
-        videoClass.Stop()
-        
-        print(colored(f"[✔] Video generated successfully at: {videoClass.get_final_video_path}", "green"))
+            print(colored(f"[*] Starting Direct HD Video Generation for Topic: '{args.prompt}'...", "cyan"))
+            videoClass = Shorts(args.prompt, 1, "g4f")
+            videoClass.GenerateScript()
+            videoClass.GenerateSearchTerms()
+            videoClass.DownloadVideos([])
+            videoClass.GenerateVoice("M3")
+            videoClass.CombineVideos()
+            videoClass.GenerateMetadata()
+            print(colored(f"[+] Video generated successfully: {videoClass.get_final_video_path}", "green"))
+        except RuntimeError as e:
+            print(colored(f"[-] Error: {e}", "red"))
+            sys.exit(1)
+        except Exception as e:
+            print(colored(f"[-] Unexpected error: {e}", "red"))
+            sys.exit(1)
     else:
-        app.run(debug=True, host=HOST, port=PORT)
+        # Normal Flask app run
+        port = int(os.getenv('API_PORT', 8080))
+        print(colored(f"[*] Starting Flask server on port {port}...", "cyan"))
+        app.run(host='0.0.0.0', port=port, debug=False)
