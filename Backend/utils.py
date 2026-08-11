@@ -104,7 +104,8 @@ def check_env_vars() -> None:
         SystemExit: If any required environment variables are missing.
     """
     try:
-        required_vars = ["PEXELS_API_KEY", "IMAGEMAGICK_BINARY"]
+        # Only IMAGEMAGICK_BINARY is strictly required; PEXELS_API_KEY is optional (fallback to Pixabay/YouTube)
+        required_vars = ["IMAGEMAGICK_BINARY"]
         missing_vars = [var for var in required_vars if not os.getenv(var)]
 
         if missing_vars:
@@ -112,6 +113,10 @@ def check_env_vars() -> None:
             logger.error(colored(f"The following environment variables are missing: {missing_vars_str}", "red"))
             logger.error(colored("Please consult 'EnvironmentVariables.md' for instructions on how to set them.", "yellow"))
             sys.exit(1)  # Aborts the program
+        
+        # Warn if PEXELS_API_KEY is missing
+        if not os.getenv("PEXELS_API_KEY"):
+            logger.warning(colored("PEXELS_API_KEY not set. Will attempt Pixabay and YouTube fallback.", "yellow"))
     except Exception as e:
         logger.error(f"Error occurred while checking environment variables: {str(e)}")
         sys.exit(1)  # Aborts the program if an unexpected error occurs
