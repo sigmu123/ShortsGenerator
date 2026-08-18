@@ -1,4 +1,4 @@
-# ShortsGenerator - Production Python Dependencies
+# ShortsGenerator - Production Python Dependencies (Pinned)
 flask>=3.0.0
 flask-cors>=4.0.0
 moviepy==1.0.3
