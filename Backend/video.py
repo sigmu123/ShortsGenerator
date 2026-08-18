@@ -7,6 +7,7 @@ import os
 import sys
 import shutil
 from typing import List, Dict, Any, Optional
+import settings
 
 # Safe MoviePy Import Shim (Supports both v1.x and v2.x)
 try:
@@ -90,14 +91,16 @@ def create_subtitle_clips(
     Generates high-retention, high-contrast animated subtitle overlays.
     """
     subtitle_clips = []
+    style_config = settings.SUBTITLE_STYLES.get(style, settings.SUBTITLE_STYLES["mrbeast"])
     
-    font_colors = {
-        "mrbeast": ("#FFFF00", "#000000"),  # Yellow on Black
-        "hormozi": ("#00FF66", "#000000"),  # Neon Green on Black
-        "neon": ("#00FFFF", "#000000"),     # Cyan on Black
-        "minimal": ("#FFFFFF", "#111111")   # Pure White on Dark
-    }
-    primary_color, stroke_color = font_colors.get(style, ("#FFFF00", "#000000"))
+    primary_color = style_config["primary_color"]
+    stroke_color = style_config["stroke_color"]
+    stroke_width = style_config["stroke_width"]
+    font_size = style_config["font_size"]
+    font_family = style_config["font"]
+    uppercase = style_config["uppercase"]
+    chunk_size = style_config["max_words_per_chunk"]
+    safe_zone_y = style_config["safe_zone_y"]
     
     time_cursor = 0.0
     
@@ -109,28 +112,26 @@ def create_subtitle_clips(
             time_cursor += duration
             continue
             
-        # Split scene text into 3-5 word readable chunks
         words = text.split()
-        chunk_size = 4
         sub_chunks = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
         chunk_duration = duration / max(len(sub_chunks), 1)
         
         for sub_text in sub_chunks:
+            display_text = sub_text.upper() if uppercase else sub_text
             try:
                 txt_clip = TextClip(
-                    sub_text.upper(),
-                    fontsize=64,
-                    font="Arial-Bold",
+                    display_text,
+                    fontsize=font_size,
+                    font=font_family,
                     color=primary_color,
                     stroke_color=stroke_color,
-                    stroke_width=4,
+                    stroke_width=stroke_width,
                     method="caption",
                     size=(int(target_w * 0.85), None),
                     align="center"
                 )
                 
-                # Position in the lower-middle visual safe zone (70% down)
-                y_pos = int(target_h * 0.70)
+                y_pos = int(target_h * safe_zone_y)
                 txt_clip = (
                     txt_clip
                     .set_position(("center", y_pos))
@@ -150,7 +151,7 @@ def build_final_short_video(
     video_clips_paths: List[str],
     voiceover_path: str,
     scenes: List[Dict[str, Any]],
-    output_path: str = "output/short_final.mp4",
+    output_path: str = "static/generated_videos/short_final.mp4",
     bg_music_path: Optional[str] = None,
     subtitle_style: str = "mrbeast"
 ) -> str:
@@ -176,7 +177,6 @@ def build_final_short_video(
             clip = VideoFileClip(v_path)
             loaded_clips.append(clip)
             
-            # Loop clip if shorter than needed
             if clip.duration < time_per_clip:
                 clip = clip.loop(duration=time_per_clip)
             else:
@@ -185,7 +185,6 @@ def build_final_short_video(
             fitted_clip = fit_to_vertical(clip)
             processed_video_clips.append(fitted_clip)
             
-        # Concatenate background video track
         if len(processed_video_clips) == 1:
             bg_video = processed_video_clips[0].set_duration(total_duration)
         else:
@@ -201,8 +200,7 @@ def build_final_short_video(
             else:
                 music_audio = music_audio.subclip(0, total_duration)
                 
-            # Duck music volume to -18dB (0.12x) under voiceover
-            music_audio = music_audio.volumex(0.12).audio_fadein(1.0).audio_fadeout(2.0)
+            music_audio = music_audio.volumex(settings.BG_MUSIC_DUCKING_VOLUME).audio_fadein(settings.BG_MUSIC_FADEIN_SEC).audio_fadeout(settings.BG_MUSIC_FADEOUT_SEC)
             audio_tracks.append(music_audio)
             
         final_audio = CompositeAudioClip(audio_tracks)
@@ -221,10 +219,10 @@ def build_final_short_video(
         # 6. Render with Hardware/Fast H.264 Presets
         final_composite.write_videofile(
             output_path,
-            fps=30,
-            codec="libx264",
-            audio_codec="aac",
-            preset="fast",
+            fps=settings.DEFAULT_FPS,
+            codec=settings.VIDEO_CODEC,
+            audio_codec=settings.AUDIO_CODEC,
+            preset=settings.PRESET,
             threads=4,
             logger=None
         )
@@ -232,7 +230,6 @@ def build_final_short_video(
         return output_path
         
     finally:
-        # Guarantees memory cleanup and unlocks files
         for c in loaded_clips:
             try: c.close()
             except: pass
