@@ -8,12 +8,12 @@ import requests
 import hashlib
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
+import settings
 
 load_dotenv()
 
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
 
-# Curated fallback keywords for high-retention aesthetic stock visuals
 FALLBACK_KEYWORDS = [
     "dark technology cyber",
     "nature drone cinematic",
@@ -39,14 +39,12 @@ def get_best_video_link(video_files: List[Dict[str, Any]], target_portrait: bool
         is_vertical = height > width
         
         if target_portrait and is_vertical:
-            # Ideal: 1080x1920 or 720x1280
             score = 1000 - abs(height - 1920)
             candidates.append((score, link))
         elif not target_portrait and not is_vertical:
             score = 1000 - abs(width - 1920)
             candidates.append((score, link))
         else:
-            # Fallback (will be cropped)
             score = 100 - abs(height - 1080)
             candidates.append((score, link))
             
@@ -64,11 +62,11 @@ def download_video_file(url: str, output_path: str) -> bool:
         with requests.get(url, stream=True, timeout=20) as r:
             r.raise_for_status()
             with open(output_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024): # 1MB chunks
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
                         
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 50000: # >50KB
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 50000:
             return True
     except Exception as e:
         print(f"[ERROR] Failed to download video from {url}: {e}")
@@ -88,7 +86,7 @@ def search_and_download_video(query: str, output_path: str, target_portrait: boo
         
     # Check local cache first
     query_hash = hashlib.md5(f"{clean_query}_{target_portrait}".encode()).hexdigest()
-    cache_path = os.path.join("temp", "cache", "videos", f"{query_hash}.mp4")
+    cache_path = os.path.join(str(settings.CACHE_DIR), "videos", f"{query_hash}.mp4")
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     
     if os.path.exists(cache_path) and os.path.getsize(cache_path) > 100000:
@@ -103,7 +101,7 @@ def search_and_download_video(query: str, output_path: str, target_portrait: boo
     headers = {"Authorization": PEXELS_API_KEY}
     queries_to_try = [
         clean_query,
-        " ".join(clean_query.split()[:2]), # First 2 words
+        " ".join(clean_query.split()[:2]),
         clean_query.split()[0] if clean_query.split() else "nature",
         "cinematic technology motion",
         "aesthetic dark background"
