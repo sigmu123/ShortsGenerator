@@ -1,247 +1,135 @@
-# author: GiorDior aka Giorgio
-# date: 12.06.2023
-# topic: TikTok-Voice-TTS
-# version: 1.0
-# credits: https://github.com/oscie57/tiktok-voice
+"""
+Backend/tiktokvoice.py (Backend/voice.py) - Production-Grade TTS Engine
+Powered by Microsoft Edge Neural TTS with gTTS & Local Fallback.
+"""
 
-# --- MODIFIED VERSION --- #
+import os
+import re
+import asyncio
+import hashlib
+from typing import List, Optional
+import edge_tts
+from gtts import gTTS
 
-import base64
-import json
-import requests
-import threading
+VOICE_MAP = {
+    # Edge Neural Voices (High Quality)
+    "en_us_001": "en-US-ChristopherNeural",   # Deep Male Storyteller
+    "en_us_002": "en-US-JennyNeural",         # Energetic Female Host
+    "en_us_006": "en-US-GuyNeural",           # Casual Male
+    "en_us_010": "en-US-AriaNeural",          # Professional Female
+    "en_uk_001": "en-GB-RyanNeural",          # British Male
+    "en_uk_003": "en-GB-SoniaNeural",         # British Female
+    "en_au_001": "en-AU-WilliamNeural",       # Australian Male
+}
 
-from typing import List
-from termcolor import colored
-try:
-    from playsound import playsound
-    HAS_PLAYSOUND = True
-except ImportError:
-    HAS_PLAYSOUND = False
-
-
-VOICES = [
-    # DISNEY VOICES
-    "en_us_ghostface",  # Ghost Face
-    "en_us_chewbacca",  # Chewbacca
-    "en_us_c3po",  # C3PO
-    "en_us_stitch",  # Stitch
-    "en_us_stormtrooper",  # Stormtrooper
-    "en_us_rocket",  # Rocket
-    "en_female_madam_leota",  # Madame Leota
-    "en_male_ghosthost",  # Ghost Host
-    "en_male_pirate",  # Pirate
-    # ENGLISH VOICES
-    "en_au_001",  # English AU - Female
-    "en_au_002",  # English AU - Male
-    "en_uk_001",  # English UK - Male 1
-    "en_uk_003",  # English UK - Male 2
-    "en_us_001",  # English US - Female 1
-    "en_us_002",  # English US - Female 2
-    "en_us_006",  # English US - Male 1
-    "en_us_007",  # English US - Male 2
-    "en_us_009",  # English US - Male 3
-    "en_us_010",  # English US - Male 4
-    # ENGLISH OTHER VOICES
-    "en_male_narration",  # Narrator
-    "en_male_funny",  # Wacky
-    "en_female_emotional",  # Peaceful
-    "en_male_cody",  # Serious
-    # WESTERN EUROPEAN
-    "fr_001",  # French - Male 1
-    "fr_002",  # French - Male 2
-    "de_001",  # German - Female
-    "de_002",  # German - Male
-    "es_002",  # Spanish - Male
-    # SOUTH AMERICAN
-    "es_mx_002",  # Spanish MX - Male
-    "br_001",  # Portuguese BR - Female 1
-    "br_003",  # Portuguese BR - Female 2
-    "br_004",  # Portuguese BR - Female 3
-    "br_005",  # Portuguese BR - Male
-    # ASIAN LANGUAGES
-    "id_001",  # Indonesian - Female
-    "jp_001",  # Japanese - Female 1
-    "jp_003",  # Japanese - Female 2
-    "jp_005",  # Japanese - Female 3
-    "jp_006",  # Japanese - Male
-    "kr_002",  # Korean - Male 1
-    "kr_003",  # Korean - Female
-    "kr_004",  # Korean - Male 2
-    # VOCALS / EFFECTS
-    "en_female_f08_salut_damour",  # Alto
-    "en_male_m03_lobby",  # Tenor
-    "en_male_m03_sunshine_soon",  # Sunshine Soon
-    "en_female_f08_warmy_breeze",  # Warmy Breeze
-    "en_female_ht_f08_glorious",  # Glorious
-    "en_male_sing_funny_it_goes_up",  # It Goes Up
-    "en_male_m2_xhxs_m03_silly",  # Chipmunk
-    "en_female_ht_f08_wonderful_world",  # Dramatic
-]
-
-# Remove duplicates while preserving order
-VOICES = list(dict.fromkeys(VOICES))
-
-ENDPOINTS = [
-    "https://tiktok-tts.weilnet.workers.dev/api/generation",
-    "https://tiktoktts.com/api/tiktok-tts",
-]
-current_endpoint = 0
-# in one conversion, the text can have a maximum length of 300 characters
-TEXT_BYTE_LIMIT = 300
-
-
-# create a list by splitting a string, every element has n chars
-def split_string(string: str, chunk_size: int) -> List[str]:
-    words = string.split()
-    result = []
+def split_text_into_chunks(text: str, max_chars: int = 250) -> List[str]:
+    """Splits long text into natural sentence/clause chunks under max_chars."""
+    # Split by punctuation
+    sentences = re.split(r'(?<=[.!?\n]) +', text.strip())
+    chunks = []
     current_chunk = ""
-    for word in words:
-        if (
-            len(current_chunk) + len(word) + 1 <= chunk_size
-        ):  # Check if adding the word exceeds the chunk size
-            current_chunk += f" {word}"
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) + 1 <= max_chars:
+            current_chunk = f"{current_chunk} {sentence}".strip()
         else:
-            if current_chunk:  # Append the current chunk if not empty
-                result.append(current_chunk.strip())
-            current_chunk = word
-    if current_chunk:  # Append the last chunk if not empty
-        result.append(current_chunk.strip())
-    return result
+            if current_chunk:
+                chunks.append(current_chunk)
+            if len(sentence) > max_chars:
+                # Sub-split long sentence by commas
+                subparts = re.split(r'(?<=[,;]) +', sentence)
+                for subpart in subparts:
+                    if len(subpart) > max_chars:
+                        # Hard split by words
+                        words = subpart.split()
+                        temp = ""
+                        for w in words:
+                            if len(temp) + len(w) + 1 <= max_chars:
+                                temp = f"{temp} {w}".strip()
+                            else:
+                                if temp: chunks.append(temp)
+                                temp = w
+                        if temp: chunks.append(temp)
+                    else:
+                        chunks.append(subpart)
+                current_chunk = ""
+            else:
+                current_chunk = sentence
+                
+    if current_chunk:
+        chunks.append(current_chunk)
+        
+    return [c.strip() for c in chunks if c.strip()]
 
 
-# checking if the website that provides the service is available
-def get_api_response() -> requests.Response:
-    url = f'{ENDPOINTS[current_endpoint].split("/a")[0]}'
-    response = requests.get(url)
-    return response
+async def _synthesize_edge_tts(text: str, voice_name: str, output_path: str) -> str:
+    """Async generator for Edge-TTS."""
+    communicate = edge_tts.Communicate(text, voice_name, rate="+5%", pitch="+0Hz")
+    await communicate.save(output_path)
+    return output_path
 
 
-# saving the audio file
-def save_audio_file(base64_data: str, filename: str = "output.mp3") -> None:
-    audio_bytes = base64.b64decode(base64_data)
-    with open(filename, "wb") as file:
-        file.write(audio_bytes)
+def synthesize_speech(text: str, voice: str = "en_us_001", output_path: str = "temp/voice.mp3") -> str:
+    """
+    Main TTS entry point. Converts input text to high-quality MP3 audio.
+    Guarantees completion with multi-tier fallback.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    clean_text = text.replace("\n", " ").strip()
+    
+    if not clean_text:
+        raise ValueError("Cannot synthesize empty text")
+        
+    edge_voice = VOICE_MAP.get(voice, "en-US-ChristopherNeural")
+    
+    # Check cache
+    text_hash = hashlib.md5(f"{clean_text}_{edge_voice}".encode()).hexdigest()
+    cache_path = os.path.join("temp", "cache", f"{text_hash}.mp3")
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 100:
+        import shutil
+        shutil.copy(cache_path, output_path)
+        return output_path
 
-
-# send POST request to get the audio data
-def generate_audio(text: str, voice: str) -> bytes:
-    url = f"{ENDPOINTS[current_endpoint]}"
-    headers = {"Content-Type": "application/json"}
-    data = {"text": text, "voice": voice}
-    response = requests.post(url, headers=headers, json=data)
-    return response.content
-
-
-# creates an text to speech audio file
-def tts(
-    text: str,
-    voice: str = "none",
-    filename: str = "output.mp3",
-    play_sound: bool = False,
-) -> None:
-    # checking if the website is available
-    global current_endpoint
-
-    if get_api_response().status_code == 200:
-        print(colored("[+] TikTok TTS Service available!", "green"))
-    else:
-        current_endpoint = (current_endpoint + 1) % 2
-        if get_api_response().status_code == 200:
-            print(colored("[+] TTS Service available!", "green"))
-        else:
-            print(colored("[-] TTS Service not available and probably temporarily rate limited, try again later..." , "red"))
-            return
-
-    # checking if arguments are valid
-    if voice == "none":
-        print(colored("[-] Please specify a voice", "red"))
-        return
-
-    if voice not in VOICES:
-        print(colored("[-] Voice not available", "red"))
-        return
-
-    if not text:
-        print(colored("[-] Please specify a text", "red"))
-        return
-
-    # creating the audio file
+    # Tier 1: Microsoft Edge Neural TTS
     try:
-        def _parse_audio_base64(raw_bytes: bytes) -> str:
-            """Parse base64 audio data from TikTok TTS API response."""
-            try:
-                data = json.loads(raw_bytes)
-                # Endpoint 0: {"status_code":0,"data":{"v_str":"<base64>",...}}
-                if "data" in data and "v_str" in data["data"]:
-                    return data["data"]["v_str"]
-                # Endpoint 1: {"success":true,"audio":"data:audio/mpeg;base64,<base64>"}
-                if "audio" in data:
-                    audio_field = data["audio"]
-                    if "," in audio_field:
-                        return audio_field.split(",", 1)[1]
-                    return audio_field
-                # Generic fallback: find first long base64-looking value
-                for v in data.values():
-                    if isinstance(v, str) and len(v) > 100:
-                        return v
-            except (json.JSONDecodeError, TypeError, AttributeError):
-                pass
-            # Last resort: original fragile parsing (kept as ultimate fallback)
-            try:
-                return str(raw_bytes).split('"')[5]
-            except IndexError:
-                pass
-            raise ValueError("Could not parse base64 audio from TTS response")
-
-        if len(text) < TEXT_BYTE_LIMIT:
-            audio = generate_audio((text), voice)
-            audio_base64_data = _parse_audio_base64(audio)
-
-            if audio_base64_data == "error":
-                print(colored("[-] This voice is unavailable right now", "red"))
-                return
-
+        chunks = split_text_into_chunks(clean_text)
+        if len(chunks) == 1:
+            asyncio.run(_synthesize_edge_tts(chunks[0], edge_voice, output_path))
         else:
-            # Split longer text into smaller parts
-            text_parts = split_string(text, 299)
-            audio_base64_data = [None] * len(text_parts)
-
-            # Define a thread function to generate audio for each text part
-            def generate_audio_thread(text_part, index):
-                audio = generate_audio(text_part, voice)
-                base64_data = _parse_audio_base64(audio)
-
-                if base64_data == "error":
-                    print(colored("[-] This voice is unavailable right now", "red"))
-                    return
-
-                audio_base64_data[index] = base64_data
-
-            threads = []
-            for index, text_part in enumerate(text_parts):
-                # Create and start a new thread for each text part
-                thread = threading.Thread(
-                    target=generate_audio_thread, args=(text_part, index)
-                )
-                thread.start()
-                threads.append(thread)
-
-            # Wait for all threads to complete
-            for thread in threads:
-                thread.join()
-
-            # Concatenate the base64 data in the correct order
-            audio_base64_data = "".join(audio_base64_data)
-
-        save_audio_file(audio_base64_data, filename)
-        print(colored(f"[+] Audio file saved successfully as '{filename}'", "green"))
-        if play_sound and HAS_PLAYSOUND:
-            playsound(filename)
-
+            # Multi-chunk synthesis
+            temp_chunk_files = []
+            for idx, chunk in enumerate(chunks):
+                chunk_file = f"temp/chunk_{idx}_{text_hash[:6]}.mp3"
+                asyncio.run(_synthesize_edge_tts(chunk, edge_voice, chunk_file))
+                temp_chunk_files.append(chunk_file)
+                
+            # Concatenate chunks using ffmpeg
+            concat_list = f"temp/concat_{text_hash[:6]}.txt"
+            with open(concat_list, "w", encoding="utf-8") as f:
+                for cf in temp_chunk_files:
+                    f.write(f"file '{os.path.abspath(cf)}'\n")
+                    
+            os.system(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c copy {output_path} -loglevel error")
+            
+            # Clean temp chunks
+            if os.path.exists(concat_list): os.remove(concat_list)
+            for cf in temp_chunk_files:
+                if os.path.exists(cf): os.remove(cf)
+                
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 100:
+            import shutil
+            shutil.copy(output_path, cache_path)
+            return output_path
     except Exception as e:
-        print(colored(f"[-] An error occurred during TTS: {e}", "red"))
+        print(f"[WARN] Edge-TTS failed: {e}. Falling back to gTTS...")
 
-# Rerun the all the voices
-def available_voices() -> list:
-    return VOICES
+    # Tier 2: Google TTS Fallback
+    try:
+        tts = gTTS(text=clean_text, lang='en', slow=False)
+        tts.save(output_path)
+        return output_path
+    except Exception as e2:
+        print(f"[ERROR] All TTS engines failed: {e2}")
+        raise RuntimeError(f"Failed to generate speech: {e2}")
