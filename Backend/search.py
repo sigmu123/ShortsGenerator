@@ -1,161 +1,146 @@
+"""
+Backend/search.py - Robust Stock Video Search & Downloader
+Supports Pexels API with Portrait (9:16) Filtering & Smart Keyword Fallbacks.
+"""
+
 import os
 import requests
-import urllib.parse
-import yt_dlp
-from typing import List
-from termcolor import colored
+import hashlib
+from typing import List, Optional, Dict, Any
+from dotenv import load_dotenv
 
-# =================================================================
-# 1. PIXABAY SEARCH FUNCTION
-# =================================================================
-def search_pixabay_videos(query: str, api_key: str, it: int, min_dur: int) -> List[str]:
-    """
-    Pixabay API se vertical stock videos search karta hai.
-    """
-    if not api_key:
-        api_key = os.getenv("PIXABAY_API_KEY")
+load_dotenv()
 
-    if not api_key:
-        print(colored("[-] No Pixabay API Key found!", "yellow"))
-        return []
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
 
-    encoded_query = urllib.parse.quote(query.strip())
-    qurl = f"https://pixabay.com/api/videos/?key={api_key}&q={encoded_query}&video_type=film&per_page={max(it * 3, 15)}"
+# Curated fallback keywords for high-retention aesthetic stock visuals
+FALLBACK_KEYWORDS = [
+    "dark technology cyber",
+    "nature drone cinematic",
+    "space galaxy stars",
+    "luxury modern architecture",
+    "abstract neon light motion",
+    "deep ocean underwater"
+]
 
-    video_urls = []
-    try:
-        print(colored(f"[*] Searching Pixabay for: '{query}'...", "cyan"))
-        r = requests.get(qurl, timeout=10)
-
-        if r.status_code == 200:
-            response = r.json()
-            hits = response.get("hits", [])
-
-            for hit in hits:
-                duration = hit.get("duration", 0)
-                if duration < min_dur:
-                    continue
-
-                videos = hit.get("videos", {})
-                # Preferences: large -> medium -> small
-                video_data = videos.get("large") or videos.get("medium") or videos.get("small")
-                
-                if video_data and video_data.get("url"):
-                    link = video_data.get("url")
-                    print(colored(f"[+] Found Pixabay Video: {link[:60]}...", "green"))
-                    video_urls.append(link)
-
-                if len(video_urls) >= it:
-                    break
-        else:
-            print(colored(f"[-] Pixabay API returned status {r.status_code}", "yellow"))
-
-    except Exception as e:
-        print(colored(f"[-] Pixabay Request failed: {e}", "yellow"))
-
-    return video_urls
-
-
-# =================================================================
-# 2. YOUTUBE FALLBACK FUNCTION
-# =================================================================
-def search_youtube_videos(query: str, it: int = 1) -> List[str]:
-    """
-    YouTube se exact topic search karke MP4 stream URL lata hai.
-    """
-    print(colored(f"[*] Searching YouTube as fallback for: '{query}'...", "cyan"))
+def get_best_video_link(video_files: List[Dict[str, Any]], target_portrait: bool = True) -> Optional[str]:
+    """Finds the optimal video stream matching 9:16 vertical resolution."""
+    candidates = []
     
-    search_query = f"ytsearch{it}:{query}"
-    ydl_opts = {
-        'format': 'best[ext=mp4]/best', 
-        'quiet': True,
-        'no_warnings': True,
-    }
-    
-    video_urls = []
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(search_query, download=False)
-            
-            if 'entries' in info:
-                for entry in info['entries']:
-                    if entry and entry.get('url'):
-                        video_urls.append(entry['url'])
-                        print(colored(f"[+] Found YouTube Video: {entry.get('title')[:50]}...", "green"))
-            elif info and info.get('url'):
-                video_urls.append(info['url'])
-                print(colored(f"[+] Found YouTube Video: {info.get('title')[:50]}...", "green"))
-                
-    except Exception as e:
-        print(colored(f"[-] YouTube search failed for '{query}': {e}", "red"))
+    for f in video_files:
+        link = f.get("link")
+        width = f.get("width", 0)
+        height = f.get("height", 0)
+        file_type = f.get("file_type", "")
         
-    return video_urls
+        if not link or "video/mp4" not in file_type:
+            continue
+            
+        is_vertical = height > width
+        
+        if target_portrait and is_vertical:
+            # Ideal: 1080x1920 or 720x1280
+            score = 1000 - abs(height - 1920)
+            candidates.append((score, link))
+        elif not target_portrait and not is_vertical:
+            score = 1000 - abs(width - 1920)
+            candidates.append((score, link))
+        else:
+            # Fallback (will be cropped)
+            score = 100 - abs(height - 1080)
+            candidates.append((score, link))
+            
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+        
+    return video_files[0].get("link") if video_files else None
 
 
-# =================================================================
-# 3. MAIN SEARCH FUNCTION (PEXELS -> PIXABAY -> YOUTUBE)
-# =================================================================
-def search_for_stock_videos(query: str, api_key: str, it: int, min_dur: int) -> List[str]:
+def download_video_file(url: str, output_path: str) -> bool:
+    """Downloads a video file using stream chunks with verification."""
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    try:
+        with requests.get(url, stream=True, timeout=20) as r:
+            r.raise_for_status()
+            with open(output_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024): # 1MB chunks
+                    if chunk:
+                        f.write(chunk)
+                        
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 50000: # >50KB
+            return True
+    except Exception as e:
+        print(f"[ERROR] Failed to download video from {url}: {e}")
+        if os.path.exists(output_path):
+            os.remove(output_path)
+    return False
+
+
+def search_and_download_video(query: str, output_path: str, target_portrait: bool = True) -> str:
     """
-    Pehle Pexels try karega -> Phir Pixabay try karega -> Phir YouTube par switch karega.
+    Searches Pexels for relevant video footage and downloads it.
+    Falls back gracefully if query returns 0 hits.
     """
+    clean_query = query.strip()
+    if not clean_query:
+        clean_query = "cinematic abstract background"
+        
+    # Check local cache first
+    query_hash = hashlib.md5(f"{clean_query}_{target_portrait}".encode()).hexdigest()
+    cache_path = os.path.join("temp", "cache", "videos", f"{query_hash}.mp4")
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     
-    # Pexels Key fetch
-    pexels_key = api_key or os.getenv("PEXELS_API_KEY") or os.getenv("PEXELS_KEY")
-    video_urls = []
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 100000:
+        import shutil
+        shutil.copy(cache_path, output_path)
+        return output_path
 
-    # --- STEP 1: PEXELS TRY KAREIN ---
-    if pexels_key:
-        headers = {
-            "Authorization": pexels_key,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        }
-        encoded_query = urllib.parse.quote(query.strip())
-        qurl = f"https://api.pexels.com/videos/search?query={encoded_query}&per_page={max(it * 3, 15)}&orientation=portrait"
+    if not PEXELS_API_KEY:
+        print("[WARN] PEXELS_API_KEY not set. Generating procedural background video placeholder.")
+        return _generate_procedural_background(output_path, target_portrait)
 
+    headers = {"Authorization": PEXELS_API_KEY}
+    queries_to_try = [
+        clean_query,
+        " ".join(clean_query.split()[:2]), # First 2 words
+        clean_query.split()[0] if clean_query.split() else "nature",
+        "cinematic technology motion",
+        "aesthetic dark background"
+    ]
+    
+    for q in queries_to_try:
         try:
-            print(colored(f"[*] Searching Pexels for: '{query}'...", "cyan"))
-            r = requests.get(qurl, headers=headers, timeout=10)
-
-            if r.status_code == 200:
-                response = r.json()
-                videos_list = response.get("videos", [])
-
-                for v in videos_list:
-                    if v.get("duration", 0) < min_dur:
-                        continue
-
-                    video_files = v.get("video_files", [])
-                    temp_video_url = ""
-                    best_res = 0
-
-                    for file in video_files:
-                        link = file.get("link", "")
-                        if ".mp4" in link or ".com" in link:
-                            res = file.get("width", 0) * file.get("height", 0)
-                            if res > best_res:
-                                best_res = res
-                                temp_video_url = link
-
-                    if temp_video_url:
-                        print(colored(f"[+] Found Pexels Video: {temp_video_url[:60]}...", "green"))
-                        video_urls.append(temp_video_url)
-
-                    if len(video_urls) >= it:
-                        break
+            orientation_param = "&orientation=portrait" if target_portrait else "&orientation=landscape"
+            url = f"https://api.pexels.com/videos/search?query={requests.utils.quote(q)}&per_page=5{orientation_param}"
+            
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                videos = data.get("videos", [])
+                
+                for video_entry in videos:
+                    video_files = video_entry.get("video_files", [])
+                    best_link = get_best_video_link(video_files, target_portrait)
+                    
+                    if best_link and download_video_file(best_link, output_path):
+                        import shutil
+                        shutil.copy(output_path, cache_path)
+                        return output_path
         except Exception as e:
-            print(colored(f"[-] Pexels Request failed: {e}", "yellow"))
+            print(f"[WARN] Pexels search failed for query '{q}': {e}")
+            
+    return _generate_procedural_background(output_path, target_portrait)
 
-    # --- STEP 2: PIXABAY TRY KAREIN (Agar Pexels par nahi mili) ---
-    if not video_urls:
-        print(colored(f"[!] No match on Pexels. Trying Pixabay...", "yellow"))
-        pixabay_key = os.getenv("PIXABAY_API_KEY")
-        video_urls = search_pixabay_videos(query, pixabay_key, it, min_dur)
 
-    # --- STEP 3: YOUTUBE AUTOMATIC SWITCH (Agar Pexels & Pixabay dono par 0 videos mili) ---
-    if not video_urls:
-        print(colored(f"[!] No match on Pexels/Pixabay for '{query}'. Auto-switching to YouTube...", "yellow"))
-        video_urls = search_youtube_videos(query, it=it)
-
-    print(colored(f"\t=> \"{query}\" successfully fetched {len(video_urls)} videos total", "cyan"))
-    return video_urls
+def _generate_procedural_background(output_path: str, target_portrait: bool = True) -> str:
+    """Generates an aesthetic vertical video using FFmpeg if no network video is found."""
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    w, h = (1080, 1920) if target_portrait else (1920, 1080)
+    cmd = (
+        f'ffmpeg -y -f lavfi -i testsrc=size={w}x{h}:rate=30 '
+        f'-vf "hue=s=0,curves=vintage,boxblur=20:1" '
+        f'-t 15 -c:v libx264 -pix_fmt yuv420p {output_path} -loglevel error'
+    )
+    os.system(cmd)
+    return output_path
