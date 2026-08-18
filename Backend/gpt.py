@@ -1,19 +1,19 @@
 """
 Backend/gpt.py - Production-Ready AI Script & Scene Generator
-Supports Google Gemini (google-genai), OpenAI API, and Offline Fallback.
+Powered by Google GenAI SDK (gemini-3.6-flash) with structured JSON output and Offline Fallback.
 """
 
 import os
 import json
 import re
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Initialize Gemini Client if API key is present
+# Initialize Gemini API key
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 
 def clean_json_response(raw_text: str) -> Dict[str, Any]:
     """Extracts and parses JSON even if wrapped in markdown codeblocks or conversational text."""
@@ -36,7 +36,7 @@ def clean_json_response(raw_text: str) -> Dict[str, Any]:
 
 
 def generate_with_gemini(topic: str, duration_sec: int = 45, tone: str = "viral") -> Dict[str, Any]:
-    """Generates structured Short script and scene keywords using Google Gemini SDK."""
+    """Generates structured Short script and scene keywords using Google Gemini SDK with gemini-3.6-flash model."""
     from google import genai
     from google.genai import types
     
@@ -74,17 +74,28 @@ Output MUST be a single valid JSON object with the following schema:
 }}
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=0.7,
-            response_mime_type="application/json"
-        )
-    )
+    # Primary target model: gemini-3.6-flash with dynamic fallbacks
+    target_models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash"]
     
-    return clean_json_response(response.text)
+    last_error = None
+    for model_name in target_models:
+        try:
+            print(f"[INFO] Attempting script generation with model: {model_name}")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.7,
+                    response_mime_type="application/json"
+                )
+            )
+            return clean_json_response(response.text)
+        except Exception as err:
+            print(f"[WARN] Model {model_name} failed: {err}")
+            last_error = err
+
+    raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
 
 
 def generate_offline_fallback(topic: str, duration_sec: int = 45) -> Dict[str, Any]:
